@@ -9,8 +9,8 @@
 # Date: 2020-08-08
 # v1.15
 
-# WF Alert: ins-citibankUSKnowyourcustomerCEM-20190128190932-000000791
-# AL Alert ID: ins-citibankUSKnowyourcustomerCEM-00-20190128190931-0016
+# WF Alert: ins-xxxxxxx-20190128190932-000000791
+# AL Alert ID: ins-xxxxxxx-00-20190128190931-0016
 import multiprocessing
 import mysql.connector
 from subprocess import Popen, PIPE
@@ -43,7 +43,7 @@ alertid2Processing = '/opt/sysadmin/packages/operations/tools/bash_config/functi
 aws_ec2_dsa = os.path.expanduser('~/ec2_dsa')
     
 report_db_username = "report"
-report_db_password = "Gojyajed1"
+report_db_password = "xxxxxxx"
 
 ###################### ADL - PRIMARY INDICATOR REGEXES ###################
 #
@@ -57,7 +57,7 @@ report_db_password = "Gojyajed1"
 #
 # You also must specify a capture group named 'search' by adding (?P<search>(REGEX))
 # Using the example:
-# 2020.08.09 22:38:14,719 [AlertDeliveryRunner-3] DEBUG com.adeptra.adeptralink.impl.ALCore - Process response event for id: ins-citibankUSFraudCreditFraudEarlyWarning-01-20200809223814-1621 response key=394323
+# 2020.08.09 22:38:14,719 [AlertDeliveryRunner-3] DEBUG com.xxxxx.adeptralink.impl.ALCore - Process response event for id: ins-xxxxxx-01-20200809223814-1621 response key=394323
 # If I wanted to capture the alert ID I would set up a capture group after id:
 # (?P<search>.*id:(.*) response key=.*)
 # This capture group only extracts data between 'id:' and 'response key='
@@ -109,7 +109,7 @@ primary_identifiers_regex_list.append('<CIN>(?P<search>([a-zA-Z0-9\*]+)\s+ )<\/C
 #
 # You also must specify a capture group named 'search' by adding (?P<search>(REGEX))
 # Using the example:
-# 2020.08.09 22:38:14,719 [AlertDeliveryRunner-3] DEBUG com.adeptra.adeptralink.impl.ALCore - Process response event for id: ins-citibankUSFraudCreditFraudEarlyWarning-01-20200809223814-1621 response key=394323
+# 2020.08.09 22:38:14,719 [AlertDeliveryRunner-3] DEBUG com.xxxxxx.adeptralink.impl.ALCore - Process response event for id: ins-xxxxxx-01-20200809223814-1621 response key=394323
 # If I wanted to capture the alert ID I would set up a capture group after id:
 # (?P<search>.*id:(.*) response key=.*)
 # This capture group only extracts data between 'id:' and 'response key='
@@ -267,8 +267,8 @@ voice_logs_script = '/opt/sysadmin/packages/operations/tools/bash_config/functio
 #voice_logs_script = 'voice-logs.sh'
 
 #Not used yet
-ccs_voice_db_username = "ccs_voice"
-ccs_voice_db_password = 'fico_ccs_XXXXX'
+ccs_voice_db_username = "voice"
+ccs_voice_db_password = 'XXXXX'
             
 ######################## DEFINE SERVICE RELCOATION  ##########################
 #
@@ -284,11 +284,9 @@ ccs_voice_db_password = 'fico_ccs_XXXXX'
 
 
 service_moved = {  
-                1: { 'cname': 'citibankusfraudcreditfraudearlywarning-apm-prod.global.adeptra.com', 'moved_on' : '2020-08-09', 'old': 'halfbeak.hosts.adeptra.com', 'new': 'ccs-10-11-5-85.hosts.adeptra.com'},
-                2: { 'cname': 'aglaucem-apm-prod.global.adeptra.com', 'moved_on' : '2020-08-19', 'old': 'ccs-10-31-5-42.hosts.adeptra.com', 'new': 'ip-10-92-17-24.hosts.adeptra.com'},
-                3: { 'cname': 'aglaucem-adl-prod.global.adeptra.com', 'moved_on' : '2020-08-19', 'old': 'ccs-10-31-64-28.hosts.adeptra.com', 'new': 'ip-10-92-29-178.hosts.adeptra.com'},
-                4: { 'cname': 'gemoneyaucollections-al-prod.global.adeptra.com', 'moved_on' : '2020-08-19', 'old': 'ccs-10-31-64-30.hosts.adeptra.com', 'new': 'ip-10-92-29-178.hosts.adeptra.com'},
-                5: { 'cname': 'gemoneyaucollections-apm-prod.global.adeptra.com', 'moved_on' : '2020-08-19', 'old': 'apm3-xian.prod.au1.adeptra.com', 'new': 'ip-10-92-17-24.hosts.adeptra.com'},
+                1: { 'cname': 'whateverservicename-apm-prod.global.adeptra.com', 'moved_on' : '2020-08-09', 'old': 'halfbeak.hosts.whatever.com', 'new': 'ccs-10-11-5-85.hosts.whatever.com'},
+                2: { 'cname': 'whatever-apm-prod.global.adeptra.com', 'moved_on' : '2020-08-19', 'old': 'ccs-10-31-5-42.hosts.whatever.com', 'new': 'ip-10-92-17-24.hosts.whatever.com'},
+
                 }
 
 ####################### SET SWITCH and ARGUMENT DEFAULTS #########################
@@ -598,7 +596,7 @@ def check_host_port(host, port):
         return 1
 
 def collect_voice_logs(alertId, environment, region, function):
-    #./voice-logs.sh inb-bradescoBRCreditFRM-20200830075450-10pcij us1 cqa logs-voiceapp
+    #./voice-logs.sh inb-xxxxxxx-20200830075450-10pcij us1 cqa logs-voiceapp
     voiceCmd =  voice_logs_script + ' ' + '"' + alertId + '"' + ' ' + region + ' ' + environment + ' ' + function
     if debug:
         print debugStr, "Voice Logs Command: " + voiceCmd
