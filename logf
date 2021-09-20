@@ -1,0 +1,3636 @@
+#!/usr/bin/python
+# -*- coding: utf-8 -*-
+
+# A script to retrieve data from A7 ADL, APM, AlertExecutor, Voice, and more
+# Detects which host it is on then searches the logs and retrieves important info
+# Identifies host role from /etc/motd
+#
+# Author: Keith Knott
+# Date: 2020-08-08
+# v1.15
+
+# WF Alert: ins-citibankUSKnowyourcustomerCEM-20190128190932-000000791
+# AL Alert ID: ins-citibankUSKnowyourcustomerCEM-00-20190128190931-0016
+import multiprocessing
+import mysql.connector
+from subprocess import Popen, PIPE
+import subprocess as sp
+import re
+import socket
+#from socket import gethostbyname, socket, AF_INET, SOCK_STREAM, getfqdn
+from sys import exit, argv
+import time
+import datetime
+import os
+import uuid
+from colorama import init
+import os, colorama
+from colorama import Fore,Style,Back
+import threading
+import itertools
+import sys
+import zipfile
+import fnmatch
+# Main variables
+
+debugStr = Fore.YELLOW + '*** DEBUG:-\t' + Style.RESET_ALL
+warnStr = Fore.RED + '*** ERROR:-\t' + Style.RESET_ALL
+today = 0
+ccsGlobal = 'global.adeptra.com'
+storageBaseDir = '/mnt/archive/archiver'
+apmCaseExplorer = '/opt/sysadmin/bin/apmCaseExplorer'
+alertid2Processing = '/opt/sysadmin/packages/operations/tools/bash_config/functions/alertid2proccluster'
+aws_ec2_dsa = os.path.expanduser('~/ec2_dsa')
+    
+report_db_username = "report"
+report_db_password = "Gojyajed1"
+
+###################### ADL - PRIMARY INDICATOR REGEXES ###################
+#
+# Primary indicators are unique identifiers like account number, caseId , alert Id, CIN (Citi), etc.
+# They are used as an 'anchor' when we grep the logs with context, and allow us to find associated data contained in the secondary regexes
+# As an example, a grep line returns both account number and has a MQ Message ID. The achor (or primary indicator) is the account number, and the secondary identifier is the associated MQ Message ID.
+#
+# These regexes are REPL type, and you MUST escape the following
+# metacharacters:  [ ] / 
+# DO NOT escape:   * < > : =
+#
+# You also must specify a capture group named 'search' by adding (?P<search>(REGEX))
+# Using the example:
+# 2020.08.09 22:38:14,719 [AlertDeliveryRunner-3] DEBUG com.adeptra.adeptralink.impl.ALCore - Process response event for id: ins-citibankUSFraudCreditFraudEarlyWarning-01-20200809223814-1621 response key=394323
+# If I wanted to capture the alert ID I would set up a capture group after id:
+# (?P<search>.*id:(.*) response key=.*)
+# This capture group only extracts data between 'id:' and 'response key='
+#
+# A sre_constants.error: unbalanced parenthesis error indicates one 
+# is escaped incorrectly.
+
+primary_identifiers_regex_list =[]
+primary_identifiers_regex_list.append('(?P<search>(ins-\w+-[0-9]{2}-[0-9]{14}-[0-9a-z]+)')
+primary_identifiers_regex_list.append('(?P<search>(inb-\w+-[0-9]{2}-[0-9]{14}-[0-9a-z]+)')
+primary_identifiers_regex_list.append('(?P<search>(ins-\w+-[0-9]{14}-[0-9]+))')
+primary_identifiers_regex_list.append('(?P<search>(inb-\w+-[0-9]{14}-[0-9a-z]{6}))')
+primary_identifiers_regex_list.append('<acctnumber>(?P<search>([a-zA-Z0-9?\*]+)).*<\/acctnumber>')
+primary_identifiers_regex_list.append('<acctNumber>(?P<search>([a-zA-Z0-9?\*]+)).*<\/acctNumber>')
+primary_identifiers_regex_list.append('<accountnumber>(?P<search>([a-zA-Z0-9?\*]+)).*<\/accountnumber>')
+primary_identifiers_regex_list.append('<accountNumber>(?P<search>([a-zA-Z0-9?\*]+)).*<\/accountNumber>')
+primary_identifiers_regex_list.append('<variable name=\"accountNumber\"><!\[CDATA\[(?P<search>(.*?))\]\]><\/variable>')
+primary_identifiers_regex_list.append('caseid>(?P<search>([a-zA-Z0-9?\*]+)).*<\/caseid>')
+primary_identifiers_regex_list.append('caseId>(?P<search>([a-zA-Z0-9?\*]+)).*<\/caseId>')
+primary_identifiers_regex_list.append('<variable name=\"caseId\"><!\[CDATA\[(?P<search>(.*?))\]\]><\/variable>')
+primary_identifiers_regex_list.append('<CIN>(?P<search>([a-zA-Z0-9\*]+)\s+ )<\/CIN>')
+#primary_identifiers_regex_list.append('<alertId>(.*)</alertId>')
+#primary_identifiers_regex_list.append('<alertid>(.*)</alertid>')
+#primary_identifiers_regex_list.append('<alertId>((ins|inb)-\w+-[0-9]{14}-[0-9]+)<\/alertId>')
+#primary_identifiers_regex_list.append('<alertId>((ins|inb)-\w+-[0-9]{2}-[0-9]{14}-[0-9]+)<\/alertId>')
+#primary_identifiers_regex_list.append('<alertid>((ins|inb)-\w+-[0-9]{14}-[0-9]+)<\/alertid>')
+#primary_identifiers_regex_list.append('<alertid>((ins|inb)-\w+-[0-9]{2}-[0-9]{14}-[0-9]+)<\/alertid>')
+#primary_identifiers_regex_list.append('<contentid>(.*)</contentid>')
+#primary_identifiers_regex_list.append('<contentId>(.*)</contentId>')
+#primary_identifiers_regex_list.append('<content>((ins|inb)-\w+-[0-9]{14}-[0-9]+)<\/content>')
+#primary_identifiers_regex_list.append('<content>((ins|inb)-\w+-[0-9]{2}-[0-9]{14}-[0-9]+)<\/content>')
+#primary_identifiers_regex_list.append('<contentid>((ins|inb)-\w+-[0-9]{14}-[0-9]+)<\/contentid>')
+#primary_identifiers_regex_list.append('<contentid>((ins|inb)-\w+-[0-9]{2}-[0-9]{14}-[0-9]+)<\/contentid>')
+#primary_identifiers_regex_list.append('<contentId>((ins|inb)-\w+-[0-9]{14}-[0-9]+)<\/contentId>')
+#primary_identifiers_regex_list.append('<contentId>((ins|inb)-\w+-[0-9]{2}-[0-9]{14}-[0-9]+)<\/contentId>')
+
+###################### ADL - SECONDARY REGEXES ###################
+#
+# Secondary indicators are identifiers like alertId, account number, caseId , CIN (Citi), MQ Message ID, Correlation ID, etc.
+# They are detected while searching for primary indicators, and will be used in subsequent greps of the log. It's important that these indicators are also unique and associate with the primary indicators.
+# Secondary indicators expand our search and allow us to find other loosely associated data contained in the log
+# As an example, a grep line returns both account number and has a MQ Message ID. The achor (or primary indicator) is the account number, and the secondary identifier is the associated MQ Message ID.
+# On the second pass of the log file, our grep search pattern would contain account number AND the MQ Message ID, yeilding data which is associated through the secondary indicator (MQ Message ID) such as 
+# result transaction ID, or the entire MQ result payload itself.
+#
+# These regexes are REPL type, and you MUST escape the following
+# metacharacters:  [ ] /
+# DO NOT escape:   * < > : =
+#
+# You also must specify a capture group named 'search' by adding (?P<search>(REGEX))
+# Using the example:
+# 2020.08.09 22:38:14,719 [AlertDeliveryRunner-3] DEBUG com.adeptra.adeptralink.impl.ALCore - Process response event for id: ins-citibankUSFraudCreditFraudEarlyWarning-01-20200809223814-1621 response key=394323
+# If I wanted to capture the alert ID I would set up a capture group after id:
+# (?P<search>.*id:(.*) response key=.*)
+# This capture group only extracts data between 'id:' and 'response key='
+#
+# A sre_constants.error: unbalanced parenthesis error indicates one 
+# is escaped incorrectly.
+
+secondary_identifiers_regex_list = []
+secondary_identifiers_regex_list.append('(?P<search>(ins-\w+-[0-9]{2}-[0-9]{14}-[0-9a-z]+)')
+secondary_identifiers_regex_list.append('(?P<search>(inb-\w+-[0-9]{2}-[0-9]{14}-[0-9a-z]+)')
+secondary_identifiers_regex_list.append('(?P<search>(ins-\w+-[0-9]{14}-[0-9]+))')
+secondary_identifiers_regex_list.append('(?P<search>(inb-\w+-[0-9]{14}-[0-9a-z]{6}))')
+secondary_identifiers_regex_list.append('<acctnumber>(?P<search>([a-zA-Z0-9?\*]+)).*<\/acctnumber>')
+secondary_identifiers_regex_list.append('<acctNumber>(?P<search>([a-zA-Z0-9?\*]+)).*<\/acctNumber>')
+secondary_identifiers_regex_list.append('<accountnumber>(?P<search>([a-zA-Z0-9?\*]+)).*<\/accountnumber>')
+secondary_identifiers_regex_list.append('<accountNumber>(?P<search>([a-zA-Z0-9?\*]+)).*<\/accountNumber>')
+secondary_identifiers_regex_list.append('<variable name=\"accountNumber\"><!\[CDATA\[(?P<search>(.*?))\]\]><\/variable>')
+secondary_identifiers_regex_list.append('<ns1:TransactionId>(?P<search>([a-zA-Z0-9?\-*]+)).*<\/ns1:TransactionId>')
+secondary_identifiers_regex_list.append('caseid>(?P<search>([a-zA-Z0-9?\*]+)).*<\/caseid>')
+secondary_identifiers_regex_list.append('caseId>(?P<search>([a-zA-Z0-9?\*]+)).*<\/caseId>')
+secondary_identifiers_regex_list.append('<variable name=\"caseId\"><!\[CDATA\[(?P<search>(.*?))\]\]><\/variable>')
+secondary_identifiers_regex_list.append('gspId>(?P<search>([a-zA-Z0-9?\*]+)).*)<\/gspId>')
+secondary_identifiers_regex_list.append('gspid>(?P<search>([a-zA-Z0-9?\*]+)).*<\/gspid>')
+secondary_identifiers_regex_list.append('<CIN>(?P<search>([a-zA-Z0-9?\*]+)).*<\/CIN>')
+secondary_identifiers_regex_list.append('Acquiring account sync for account (?P<search>(.*))$')
+secondary_identifiers_regex_list.append('response key=(?P<search>(\[0-9\]{1,10}))')
+secondary_identifiers_regex_list.append('correlationId=(?P<search>([0-9a-z*]{48}))')
+secondary_identifiers_regex_list.append('msgId=(?P<search>([0-9a-z\*]{48}))')
+secondary_identifiers_regex_list.append('messageId=(?P<search>([0-9a-z\*]{48}))')
+#For lookup reponses
+secondary_identifiers_regex_list.append('<variable name=\"name\">.*<\/name><value>(?P<search>(.*?))<\/value>')
+
+#For thread Ids
+
+#secondary_identifiers_regex_list.append('<alertId>(.*)</alertId>')
+#secondary_identifiers_regex_list.append('<alertid>(.*)<\/alertid>')
+
+#secondary_identifiers_regex_list.append('<alertId>((ins|inb)-\w+-[0-9]{14}-[0-9]+)<\/alertId>')
+#secondary_identifiers_regex_list.append('<alertId>((ins|inb)-\w+-[0-9]{2}-[0-9]{14}-[0-9]+)<\/alertId>')
+
+#secondary_identifiers_regex_list.append('<alertid>((ins|inb)-\w+-[0-9]{14}-[0-9]+)<\/alertid>')
+#secondary_identifiers_regex_list.append('<alertid>((ins|inb)-\w+-[0-9]{2}-[0-9]{14}-[0-9]+)<\/alertid>')
+
+#secondary_identifiers_regex_list.append('<content>(.*)</content>')
+#secondary_identifiers_regex_list.append('<contentid>(.*)</contentid>')
+#secondary_identifiers_regex_list.append('<contentId>(.*)</contentId>')
+
+#secondary_identifiers_regex_list.append('<content>((ins|inb)-\w+-[0-9]{14}-[0-9]+)<\/content>')
+#secondary_identifiers_regex_list.append('<content>((ins|inb)-\w+-[0-9]{2}-[0-9]{14}-[0-9]+)<\/content>')
+
+#secondary_identifiers_regex_list.append('<contentid>((ins|inb)-\w+-[0-9]{14}-[0-9]+)<\/contentid>')
+#secondary_identifiers_regex_list.append('<contentid>((ins|inb)-\w+-[0-9]{2}-[0-9]{14}-[0-9]+)<\/contentid>')
+
+#secondary_identifiers_regex_list.append('<contentId>((ins|inb)-\w+-[0-9]{14}-[0-9]+)<\/contentId>')
+#secondary_identifiers_regex_list.append('<contentId>((ins|inb)-\w+-[0-9]{2}-[0-9]{14}-[0-9]+)<\/contentId>')
+
+#secondary_identifiers_regex_list.append('<variable name=\"contactId\"><!\[CDATA\[(?P<search>(.*?))\]\]><\/variable>')
+###secondary_identifiers_regex_list.append('CommunicationId>(?P<search>([a-zA-Z0-9?\*]+)).*<\/ns1:CommunicationId>')
+
+#secondary_identifiers_regex_list.append('<payloadid>(.*)</payloadid>')
+#secondary_identifiers_regex_list.append('<payloadId>(.*)</payloadId>')
+
+#secondary_identifiers_regex_list.append('<payloadid>((ins|inb)-\w+-[0-9]{14}-[0-9]+)<\/payloadid>')
+#secondary_identifiers_regex_list.append('<payloadId>((ins|inb)-\w+-[0-9]{2}-[0-9]{14}-[0-9]+)<\/payloadId>')
+#secondary_identifiers_regex_list.append('<payloadId>((ins|inb)-\w+-[0-9]{14}-[0-9]+)<\/payloadId>')
+#secondary_identifiers_regex_list.append('<payloadid>((ins|inb)-\w+-[0-9]{2}-[0-9]{14}-[0-9]+)<\/payloadid>')
+
+#secondary_identifiers_regex_list.append('<payloadreference>(.*)</payloadreference>')
+#secondary_identifiers_regex_list.append('<payloadReference>(.*)</payloadReference>')
+
+#secondary_identifiers_regex_list.append('<payloadreference>((ins|inb)-\w+-[0-9]{14}-[0-9]+)<\/payloadreference>')
+#secondary_identifiers_regex_list.append('<payloadreference>((ins|inb)-\w+-[0-9]{2}-[0-9]{14}-[0-9]+)<\/payloadreference>')
+#secondary_identifiers_regex_list.append('<payloadReference>((ins|inb)-\w+-[0-9]{14}-[0-9]+)<\/payloadReference>')
+#secondary_identifiers_regex_list.append('<payloadReference>((ins|inb)-\w+-[0-9]{2}-[0-9]{14}-[0-9]+)<\/payloadReference>')
+
+#secondary_identifiers_regex_list.append('<tranId>(?P<search>([a-zA-Z0-9?\*]+)).*<\/tranId>')
+#secondary_identifiers_regex_list.append('<tranid>(?P<search>([a-zA-Z0-9?\*]+)).*<\/tranid>')
+#secondary_identifiers_regex_list.append('TransactionId>(?P<search>([a-zA-Z0-9?\*]+)).*<\/ns1:TransactionId')
+
+
+###################### ADL - THREAD IDENTIFIERS REGEX ###################
+# Thread identifiers are regexes which capture the thread ID contained in the log line. 
+# Thread IDs are used to filter out irrelevant log lines when a grep is executed with context (example: 50 lines before, and 50 lines after the match)
+#
+# These regexes are REPL type, and you MUST escape the following
+# metacharacters:  [ ] /
+# DO NOT escape:   * < > : =
+#
+# A sre_constants.error: unbalanced parenthesis error indicates one 
+# is escaped incorrectly.
+#
+thread_identifiers_regex_list = []
+thread_identifiers_regex_list.append('(?P<search>\[DataFetchThread-[0-9]+\])')
+thread_identifiers_regex_list.append('(?P<search>\[EventDeliveryRunner-[0-9]+\])')
+thread_identifiers_regex_list.append('(?P<search>\[AlertDeliveryRunner-[0-9]+\])')
+#thread_identifiers_regex_list.append('(?P<search>\[MessageListener[0-9]{0,6}-[0-9]+\])')
+thread_identifiers_regex_list.append('(?P<search>\[ResultDeliveryRunner[0-9]+-[0-9]+\])')
+thread_identifiers_regex_list.append('(?P<search>\[InputProcessor-[0-9]+\])')
+thread_identifiers_regex_list.append('(?P<search>\[SelfSignedJsseListener[0-9]+-[0-9]+\])')
+thread_identifiers_regex_list.append('(?P<search>signature=([0-9]+-[0-9]+),')
+thread_identifiers_regex_list.append('(?P<search>\[((Message|Socket)Listener[0-9]{0,5}-[0-9]+\]))')
+
+# A7 SMS - Match SocketListener Threads without com.adeptra7.sms, etc as the anchors will be picked up in a later regex
+#thread_identifiers_regex_list.append('(?P<search>\[SocketListener[0-9]{0,6}-[0-9]+\]).*(?!com.adeptra7.sms|com.adeptra7.mblox|com.adeptra7.analytics|com.adeptra7.sybase|com.adeptra7.openmarket|com.adeptra7.jmsrpc)')
+# A7 SMS - Match MessageListener Threads without com.adeptra7.sms, etc as the anchors will be picked up in a later regex
+#thread_identifiers_regex_list.append('(?P<search>\[MessageListener[0-9]{0,6}-[0-9]+\]).*(?!com.adeptra7.sms|com.adeptra7.mblox|com.adeptra7.analytics|com.adeptra7.sybase|com.adeptra7.openmarket|com.adeptra7.jmsrpc)')
+# A7 SMS - Match SocketListener Threads without com.adeptra7.sms, etc as the anchors will be picked up in a later regex
+#thread_identifiers_regex_list.append('(?P<search>\[SocketListener[0-9]{0,6}-[0-9]+\]).*(?!com.adeptra7.email|com.adeptra7.inboundrequest|com.adeptra7.jmsrpc)')
+# A7 SMS - Match MessageListener Threads without com.adeptra7.sms, etc as the anchors will be picked up in a later regex
+#thread_identifiers_regex_list.append('(?P<search>\[MessageListener[0-9]{0,6}-[0-9]+\]).*(?!com.adeptra7.email|com.adeptra7.inboundrequest|com.adeptra7.jmsrpc)')
+
+#For grepping A7 SMS Logs - replaced by more generic regexes above
+#thread_identifiers_regex_list.append('(?P<search>\[((Message|Socket)Listener[0-9]{0,2}-[0-9]{1,4}\]).*(?:smsRequestReceived|sendSMSStarted|sendSMSCompleted|smsRequestReceived|alertInterruptToBeRequested|alertInterruptedSuccessfully)')
+#For grepping A7 Email Logs - replaced by more generic regexes above
+#thread_identifiers_regex_list.append('(?P<search>\[((Message|Socket)Listener[0-9]{0,2}-[0-9]{1,4}\]).*(?:alertInsertStart|notificationMessageIdResolved|processingTypeSelected|responseHandlerData|notificationResponseSpec|notificationTimoutExpired|interactiveEmailRequestReceived|messageSent|interactiveEmailNotificationUpdateReceived)') 
+
+#thread_identifiers_regex_list.append('(?P<search>\[(Message|Socket)Listener[0-9]{0,2}-[0-9]{1,4}\]).*smsRequestReceived')
+#thread_identifiers_regex_list.append('(?P<search>\[(Message|Socket)Listener[0-9]{0,2}-[0-9]{1,4}\]).*interactiveEmailRequestReceived')
+
+
+####################### SET FILENAME DEFAULTS #########################
+#
+# This is where you'd define the service filenames.
+# I wouldn't expect these to change, however if a feature is addeded
+# then the list would need to be updated. 
+#
+service_filename = {  
+                    'ae': str('alertExecutor.log'), 
+                    'adl': str('adeptralink.log'), 
+                    'email': str('email.log'), 
+                    'sms': str('sms.log'),
+                    'smsinb': str('smsInbound.log'),
+                    }
+
+#Where to write output files
+output_directory = '/tmp/'
+
+####################### SET CCS VOICE DEFAULTS #########################
+#
+# This is where you'd define the ccs voice region mapping
+#
+
+ccs_voice_region_mapping = {
+                            'au': [ 'au3' ],
+                            'cn': [ 'cn1', 'cn2' ],
+                            'gb': [ 'gb1', 'gb2', 'gb3' ],
+                            'in': [ 'in1' ],
+                            'jp': [ 'jp1' ],
+                            'ph': [ 'ph1' ],
+                            'sg': [ 'sg2' ],
+                            'us': [ 'us1','us4', 'us5' ]
+}
+
+voice_logs_script = '/opt/sysadmin/packages/operations/tools/bash_config/functions/ccsvoice-logs.sh'
+#voice_logs_script = 'voice-logs.sh'
+
+#Not used yet
+ccs_voice_db_username = "ccs_voice"
+ccs_voice_db_password = 'fico_ccs_XXXXX'
+            
+######################## DEFINE SERVICE RELCOATION  ##########################
+#
+# This is where we'd define services which move from one host to another
+# for example a migration from CENTOS6 to CENTOS7.
+# Dates in the past and the future are supported and should be in the format YYYY-MM-DD
+# CNAME should be the CNAME used by the service and 'old' and 'new' should be the FQDN hostname
+#
+# Example:
+#  service_moved = {  1: { 'cname': 'citibankusfraudcreditfraudearlywarning-apm-prod.global.adeptra.com', 'moved_on' : '2020-08-09', 'old': 'halfbeak.hosts.adeptra.com', 'new': 'ccs-10-11-5-85.hosts.adeptra.com'},
+#                   2: { 'cname': 'citibankusfraudcreditfraudearlywarning-adl-prod.global.adeptra.com', 'moved_on' : '2021-08-05', 'old': 'goosefish.hosts.adeptra.com', 'new': 'gibberfish.hosts.adeptra.com'},
+#                   }
+
+
+service_moved = {  
+                1: { 'cname': 'citibankusfraudcreditfraudearlywarning-apm-prod.global.adeptra.com', 'moved_on' : '2020-08-09', 'old': 'halfbeak.hosts.adeptra.com', 'new': 'ccs-10-11-5-85.hosts.adeptra.com'},
+                2: { 'cname': 'aglaucem-apm-prod.global.adeptra.com', 'moved_on' : '2020-08-19', 'old': 'ccs-10-31-5-42.hosts.adeptra.com', 'new': 'ip-10-92-17-24.hosts.adeptra.com'},
+                3: { 'cname': 'aglaucem-adl-prod.global.adeptra.com', 'moved_on' : '2020-08-19', 'old': 'ccs-10-31-64-28.hosts.adeptra.com', 'new': 'ip-10-92-29-178.hosts.adeptra.com'},
+                4: { 'cname': 'gemoneyaucollections-al-prod.global.adeptra.com', 'moved_on' : '2020-08-19', 'old': 'ccs-10-31-64-30.hosts.adeptra.com', 'new': 'ip-10-92-29-178.hosts.adeptra.com'},
+                5: { 'cname': 'gemoneyaucollections-apm-prod.global.adeptra.com', 'moved_on' : '2020-08-19', 'old': 'apm3-xian.prod.au1.adeptra.com', 'new': 'ip-10-92-17-24.hosts.adeptra.com'},
+                }
+
+####################### SET SWITCH and ARGUMENT DEFAULTS #########################
+                    
+debug = 0
+quiet = 0
+script = 0  # #default to script mode
+zipfilename = 0
+file_output = 0
+verbose=0
+
+ccsEnv = 'prod'  # We default to prod
+
+voice=0
+ae= 0
+sms=0
+email=0
+smsinb=0
+ce=0
+apm = 0
+apmRulesVerbose = 0
+apmraw = 0
+apmRules = 0
+apmCaseRef = 0
+payload = 0
+adl = 0
+verbose=0
+console=1
+adlLogs = []
+inputId = ''
+dc = ''
+logDate = ''
+log_t = ''
+rollover_t = ''
+idDict = {}
+alId = ''
+alertId = ''
+logfile = ''
+logsOnStorage = 0
+thirdPassContext = 100
+
+# Usage
+
+USAGE = \
+    '''\
+Usage: logf [ID]... [OPTION]...
+Extracts data from appropriate service host's logfile
+Example: logf ins-myCompanyFRM-01-201704254532-0229
+(ID can be an AL ID, Alert ID, or APM caseRef)
+
+Note: This should be run from a host like swordfish or kafue which has DB and Host access
+
+Optional switches:
+    
+  Note: The following should be run from bastion or storage hosts.
+  
+  -adl | --adl\t\t\treturn ADL logs
+  -p   | --payload\t\treturn ADL insert payload
+  -c   | --caseref\t\tretrieve apm caseRef
+  -r   | --rules\t\treturn apm rules
+  -rd  | --rulesdetail\t\treturn apm rules but show conditions and actions
+  -apm | --apm\t\t\treturn all apm rules verbosely (raw log content)
+  -ce  | --explorer\t\treturn apmCaseExplorer output
+  -ae  | --executor\t\treturn alertExecutor logs 
+  -em  | --email\t\treturn emailService logs 
+  -sms | --sms\t\t\treturn smsService logs 
+ -smsi | --smsinb\t\treturn smsInboundService logs 
+  -all | --all\t\t\treturn all available log types
+
+Search:
+  --deep\t\tExecute final search with 300 lines of context (default: 100)
+ 
+Environment:
+  --cqa | --prod\t\toverride environment (cqa|prod) default: automatic
+
+Output Mode:
+
+-con | --console\t\tprint logs and other info to console
+  -f | --file\t\t\toutput writes logs to files
+  -z | --zip\t\t\tcreate a zip package containing the logs collected
+  -d | --debug\t\t\tfull debug output
+
+  '''
+################## CLASSES ##################################
+CLEAR_LINE = '\033[K'
+
+#pattern_json = '{
+#	"1": ["(-)", "(/)", "(|)", "(\\)"],
+#	"2": ["Ooo", "oOo", "ooO", "oOo"],
+#    "3": ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"],
+#    "4": [".  ", ".. ", "...", " ..", "  .", "   "],
+#    "5": [ "◐", "◓", "◑", "◒" ],
+#    "6": [ "∙∙∙", "●∙∙", "∙●∙", "∙∙●", "∙∙∙" ],
+#    "7": [ "( ●    )", "(  ●   )", "(   ●  )", "(    ● )", "(     ●)", "(    ● )", "(   ●  )", "(  ●   )", "( ●    )", "(●     )" ]
+#}'
+
+
+import sys
+import threading
+import itertools
+import time
+
+class Spinner(object):
+    #spinner_cycle = itertools.cycle(['-', '/', '|', '\\'])
+    #spinner_cycle = itertools.cycle(["( ●    )", "(  ●   )", "(   ●  )", "(    ● )", "(     ●)", "(    ● )", "(   ●  )", "(  ●   )", "( ●    )", "(●     )"])
+    spinner_cycle = itertools.cycle([" ⠋ ", " ⠙ ", " ⠹ ", " ⠸ ", " ⠼ ", " ⠴ ", " ⠦ ", " ⠧ ", " ⠇ ", " ⠏ "])
+    #spinner_cycle = itertools.cycle([ " ∙∙∙", " ●∙∙", " ∙●∙", " ∙∙●", " ∙∙∙" ])
+    #spinner_cycle = itertools.cycle(['( ●    )', '(  ●   )', '(   ●  )', '(    ● )', '(     ●)', '(    ● )', '(   ●  )', '(  ●   )','( ●    )', '(●     )'])
+
+    def __init__(self, beep=False, disable=False, force=False, stream=sys.stdout, message="Loading...."):
+        self.disable = disable
+        self.beep = beep
+        self.force = force
+        self.stream = stream
+        self.stop_running = None
+        self.spin_thread = None
+        self.message = message
+        #self.stream.write(CLEAR_LINE)
+        self.stream.write('\b\b\b\b\b\r')            
+        
+    def start(self):
+        if self.disable:
+            return
+        if self.stream.isatty() or self.force:
+            self.stop_running = threading.Event()
+            self.spin_thread = threading.Thread(target=self.init_spin)
+            self.spin_thread.start()
+            self.stream.write(self.message)
+            self.stream.write(CLEAR_LINE)
+            self.stream.write('\b\b\b\b\b\r')            
+            
+    def stop(self):
+        if self.spin_thread:
+            self.stop_running.set()
+            self.spin_thread.join()
+            self.stream.write(CLEAR_LINE)
+            self.stream.write('\b\b\b\b\b\r')            
+            
+
+    def init_spin(self):
+        while not self.stop_running.is_set():
+            self.stream.write(next(self.spinner_cycle))
+            self.stream.flush()
+            self.stop_running.wait(0.25)
+            self.stream.write('\b\b\b\b\b')
+            self.stream.flush()
+
+    def __enter__(self):
+        self.start()
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        if self.disable:
+            return False
+        self.stop()
+        if self.beep:
+            self.stream.write('\7')
+            self.stream.flush()
+        return False
+
+
+def spinner(beep=False, disable=False, force=False, stream=sys.stdout, message=""):
+    """This function creates a context manager that is used to display a
+    spinner on stdout as long as the context has not exited.
+    The spinner is created only if stdout is not redirected, or if the spinner
+    is forced using the `force` parameter.
+    Parameters
+    ----------
+    beep : bool
+        Beep when spinner finishes.
+    disable : bool
+        Hide spinner.
+    force : bool
+        Force creation of spinner even when stdout is redirected.
+    Example
+    -------
+        with spinner():
+            do_something()
+            do_something_else()
+    """
+    return Spinner(beep, disable, force, stream, message)
+
+###############################################################
+#
+#                  DATABASE FUNCTIONS
+#
+###############################################################
+
+
+def select_query(host, user, password, database, sql, mode):
+    rows = []
+    # mode = single to fetch one row
+    # mode = multi to fetch all rows
+    # Connect to server
+    config = {
+        'host' : host,
+        'port' : 3306,
+        'user' : user,
+        'password' : password,
+        'database' : database,
+        'charset': 'utf8',
+        'use_unicode': False,
+        'connection_timeout': 3
+    }
+    
+    #Connect to Database
+    try:
+        db = mysql.connector.Connect(**config)
+        
+        # Get a cursor
+        cursor = db.cursor()
+        # Execute a query
+        cursor.execute(sql)
+    
+        if mode == "single":
+            # Fetch one result
+            row = cursor.fetchone()
+            rows.append(row[0])
+        elif mode == "multi":
+            #Returns object with multiple rows
+            for row in cursor.fetchall():
+                rows.append(row)
+        else:
+            if debug:
+                print debugStr, "select_query(): Mode was not specified correctly"
+
+            # Close connection
+            cursor.close()
+            db.close()
+    except:
+        if debug:
+            print debugStr, "select_query(): Could not connect or query failed on host: " + host
+    
+    return rows
+    
+def query_dwhglobal(host, alertid):
+    # CCS Voice DB Config
+    user = report_db_username
+    password = report_db_password
+    database = "global"
+    mode = "single"
+    
+    sql = 'select ClusterID from tblAlert INNER JOIN tblCluster where fkCluster_ID=pkCluster_ID AND AlertId="' + alertid + '"'
+    row=select_query(host, user, password, database, sql, mode)
+    if debug:
+        print debugStr, "Database Query Result: " + str(row) + " (host: " + host + ")"
+    
+    if len(row) > 0 and row != None:
+        output = row[0]
+        return output, host
+    else:
+        return None, None
+        #output = []
+    
+
+def query_all_dwhglobal(environment, alertid):
+    # Determine DWH Global host
+    cfindCmd = "/opt/sysadmin/bin/cnameFind '^dwhglobal-\w+." + environment + "' | awk '{ print $1 }'"
+    if debug:
+        print debugStr , 'query_all_dwhglobal(): ' + cfindCmd
+    
+    hosts = run_proc(cfindCmd).stdout.readlines()
+    hosts_container = []
+    for host in hosts:
+        hosts_container.append(host.strip().rstrip('.'))
+        if debug:
+            print debugStr, "query_all_dwhglobal(): Found DWH Global DB Host: " + socket.getfqdn(host.strip().rstrip('.'))
+    
+    for host in hosts_container:
+        fqdn = socket.getfqdn(host)
+        (result, host)=query_dwhglobal(fqdn, alertid)
+        if result != None and len(result) > 0 and len(host) > 0:
+            return result, host
+        else:
+            continue
+
+
+def query_ccsvoice_cdr():
+    pass
+    
+
+###############################################################
+#
+#                   EXTERNAL COMMAND FUNCTIONS
+#
+###############################################################
+
+def run_proc(cmd, mode='default'):
+    if mode == 'read':
+        p = Popen(cmd, shell=True, stdout=PIPE, stderr=PIPE).stdout.read()
+    if mode == 'readlines':
+        p = Popen(cmd, shell=True, stdout=PIPE, stderr=PIPE).stdout.readlines()
+    else:
+        p = Popen(cmd, shell=True, stdout=PIPE, stderr=PIPE)
+    return p
+                
+def check_host_port(host, port):
+    
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.settimeout(5)
+    try:
+        0 == s.connect((host, port))
+        s.shutdown(1)
+        s.close()
+        return 0
+    except:
+        return 1
+
+def collect_voice_logs(alertId, environment, region, function):
+    #./voice-logs.sh inb-bradescoBRCreditFRM-20200830075450-10pcij us1 cqa logs-voiceapp
+    voiceCmd =  voice_logs_script + ' ' + '"' + alertId + '"' + ' ' + region + ' ' + environment + ' ' + function
+    if debug:
+        print debugStr, "Voice Logs Command: " + voiceCmd
+        
+    voiceLines = run_proc(voiceCmd).stdout.readlines()
+    if debug:
+        debugStr, "Voice process returned " + Fore.GREEN + str(len(voiceLines)) + Style.RESET_ALL + " lines"
+    return voiceLines
+    
+
+###############################################################
+#
+#                   FILENAME FUNCTIONS
+#
+###############################################################
+
+def write_list_to_file(filename, lines_list):
+    with open(filename, 'a') as filehandle:
+        filehandle.writelines("%s\n" % line for line in lines_list)
+    return
+
+def generate_filenames():
+    global output_file_names
+    output_file_names = {  
+                        'al': str(output_directory + 'al_' + uuid.uuid4().hex + '.txt'), 
+                        'apmraw': str(output_directory  + 'apm_raw_'  + uuid.uuid4().hex + '.txt'),
+                        'apmcaseexplorer': str(output_directory  + 'apm_ce_' + uuid.uuid4().hex + '.txt'),
+                        'apmrules': str(output_directory  + 'apm_rules_' + uuid.uuid4().hex + '.txt'),
+                        'ae': str(output_directory + 'ae_' + uuid.uuid4().hex + '.txt'),
+                        'payload': str(output_directory  + 'al_payload_' + uuid.uuid4().hex + '.txt'),
+                        'email': str(output_directory + 'email_' + uuid.uuid4().hex + '.txt'),
+                        'smsinb': str(output_directory + 'smsinb_' + uuid.uuid4().hex + '.txt'),
+                        'sms': str(output_directory + 'sms_' + uuid.uuid4().hex + '.txt'),
+                        'call-stats': str(output_directory + 'call_stats_' + uuid.uuid4().hex + '.txt'),
+                        'logs-voiceapp': str(output_directory + 'voiceapp_' + uuid.uuid4().hex + '.txt'),
+                        'logs-freeswitch': str(output_directory + 'freeswitch_' + uuid.uuid4().hex + '.txt'),
+                        'logs-voice-controller': str(output_directory + 'voice-controller_' + uuid.uuid4().hex + '.txt'),
+                        'logs-vii-agent': str(output_directory + 'vii-agent_' + uuid.uuid4().hex + '.txt'),                            
+                        }
+def create_zip_archive(alertId):
+    files_to_zip = []
+    #Search working directory for files matching the one's we're interested in
+    #Note these are GLOBAL Filenames
+    for output_file in output_file_names:
+        for filename in os.listdir(output_directory):
+            if fnmatch.fnmatch(filename, os.path.basename(output_file_names[output_file])):
+                if debug:
+                    print debugStr, "Adding log file to zip archive: " + filename
+                fff = os.path.join(output_directory, filename)
+                files_to_zip.append(fff)
+            else:
+                continue
+    if len(files_to_zip) > 0:
+	    #Name the zip file the alertId.zip
+        zipFilename = alertId + ".zip"
+        ZipFile = zipfile.ZipFile(zipFilename, "w" )
+        #Iterate through the list of files to zip and zip them
+        for f in files_to_zip:
+            ZipFile.write(f, "/" + os.path.basename(f), compress_type=zipfile.ZIP_DEFLATED)
+        return zipFilename
+    else:
+        print warnStr, "No results returned, skipping zip archive since it would be empty."
+    return ""
+
+###############################################################
+#
+#                   DATETIME FUNCTIONS
+#
+###############################################################
+
+def date_from_epoch(formattedId, idDict):
+    for segment in formattedId:
+        if re.match('[0-9]{13}', segment):
+            
+            # Expecting 10 chars only (epoch time in our era ; )
+            
+            epoch = segment[:10]
+            alertDate = time.gmtime(float(epoch))
+    if debug:
+        print debugStr, 'Epoch conversion: ', alertDate
+    idDict['year'] = str(alertDate[0])
+    idDict['month'] = str(alertDate[1])
+    idDict['day'] = str(alertDate[2])
+    
+    # Add a leading zero for month and date < 10
+    
+    if re.match('^[1-9]$', idDict['month']):
+        idDict['month'] = '0' + idDict['month']
+    idDict['day'] = str(alertDate[2])
+    if re.match('^[1-9]$', idDict['day']):
+        idDict['day'] = '0' + idDict['day']
+    return idDict
+
+def find_surrounding_dates(alertId,search_type):
+    dates_to_search =[]
+    try:
+        # Split ID into component parts    
+        idDict = split_id(alertId)
+        appName = idDict['name']
+
+        # Create logDate string and compare if today
+        logDate = idDict['year'] + '-' + idDict['month'] + '-' \
+        + idDict['day']
+
+        day_of = str(datetime.datetime.strptime(logDate, '%Y-%m-%d').date())
+        day_after = str((datetime.datetime.strptime(logDate, '%Y-%m-%d') + datetime.timedelta(days=1)).date()) 
+        day_before = str((datetime.datetime.strptime(logDate, '%Y-%m-%d') - datetime.timedelta(days=1)).date())
+        today_t = datetime.date.today()
+        #Does log match todays date
+        if search_type == "nextday":
+            if logDate == time.strftime('%Y-%m-%d'):
+                #Search yesterdays log, currently disabled
+                #dates_to_search.append(day_before)
+                dates_to_search.append(day_of)
+            else:
+                #Search yesterdays log, currently disabled
+                #dates_to_search.append(day_before)
+                dates_to_search.append(day_of)
+                dates_to_search.append(day_after)
+        elif search_type == "today":
+            if logDate == time.strftime('%Y-%m-%d'):
+                #Search yesterdays log, currently disabled
+                #dates_to_search.append(day_before)
+                dates_to_search.append(day_of)
+            else:
+                #Search yesterdays log, currently disabled
+                #dates_to_search.append(day_before)
+                dates_to_search.append(day_of)
+        return dates_to_search
+    except:
+        print warnStr, "Fatal: Error identifying surrounding dates."
+        exit(1)
+    
+def custom_datetime_sort(x):
+    try:
+        try:
+            return datetime.datetime.strptime(x[0:23], '%Y.%m.%d %H:%M:%S,%f')
+        except:
+            return datetime.datetime.strptime(x[0:23], '%Y-%m-%d %H:%M:%S,%f')
+    except ValueError:
+        # do something else if the date format is different
+        x="1970.01.01 00:00:00,000"
+        return datetime.datetime.strptime(x, '%Y.%m.%d %H:%M:%S,%f')
+    except KeyError:
+        # do something else if there is no 'date' key in x
+        # ...
+        x="1970.01.01 00:00:00,000"
+        return datetime.datetime.strptime(x, '%Y.%m.%d %H:%M:%S,%f')
+
+def remove_truncated_elements_matching_timestamp(myList=[]):
+    #delete first record in list
+    #del myList[0]
+    
+    output=[]
+    for line in myList:
+        time=line[0:23]
+        result = [i for i in myList if i.startswith(time)]
+        max_len = -1
+        if debug:
+            pass
+            #print "Looking for shorter duplicates of line ----> " + line + "\n" 
+        match_container = []
+        for r in result:
+            if line in r:
+               match_container.append(r)
+        if debug:
+            pass
+            #print "Match Container Length: " + str(len(match_container))
+        longest_string=max(match_container, key=len)
+        if len(longest_string) > 1 and (len(longest_string) > len(line)):
+            keep=longest_string
+            if debug:
+                pass
+                #print "Found Longest Match! Original Length: " + str(len(line)) + " Matched Line Length: " + str(len(longest_string)) + "\n" + "Chosen Line: " + longest_string + "\n"
+        elif len(longest_string) > 1 and (len(longest_string) == len(line)): 
+            keep=line
+            if debug:
+                pass
+                #print "Length Matches. Keeping Original String. Original Length: " + str(len(line)) + " Matched Line Length: " + str(len(longest_string)) + "\n"
+        elif len(longest_string) > 1 and (len(longest_string) < len(line)): 
+            keep=line
+            if debug:
+                pass
+                #print "Match is Shorter! Keeping Original String. Original Length: " + str(len(line)) + " Matched Line Length: " + str(len(longest_string)) + "\n"
+        else:
+            keep=line
+            if debug:
+                pass
+                #print "Fallthrough. Keeping Original String. Original Length: " + str(len(line)) + " Matched Line Length: " + str(len(longest_string)) + "\n"
+
+        output.append(keep)
+     
+    return output
+
+###############################################################
+#
+#                   DERIVE ALERTID or APPNAME FUNCTIONS
+#
+###############################################################
+
+def split_id(inputId):
+    idDict = {}
+    
+    # Extract Id and break into component parts:
+    
+    if debug:
+        print debugStr, 'Input:', inputId
+    formattedId = inputId.split('-')
+    
+    # store the type of alert (apm, inb, ins, opstest, etc)
+    
+    idDict['type'] = formattedId[0]
+    
+    # appName is always the second field (split on '-' )
+    
+    idDict['name'] = formattedId[1]
+    
+    # Date might be second/third field, so we use regex match
+    
+    for segment in formattedId:
+        if debug:
+            print debugStr, 'Segment: ', segment
+        if re.match('^[0-9]{14}', segment):
+            if debug:
+                print debugStr, 'Matched: ', segment
+            idDict['year'] = segment[0:4]
+            idDict['month'] = segment[4:6]
+            idDict['day'] = segment[6:8]
+    
+    # If date format not found, check for epoch
+    
+    try:
+        idDict['year']
+    except:
+        date_from_epoch(formattedId, idDict)
+    return idDict
+
+def extract_alid(line):
+    try:
+        alId = re.search("(?P<alId>inb-\w+-[0-9]{14}-[0-9a-z]+)",line).group('alId')
+        return alId
+    except:
+        try:
+            alId = re.search("<alertid>(?P<alId>(ins|inb)-\w+-[0-9]{2}-[0-9]{14}-[0-9a-z]+)<\/alertid>", line).group('alId')
+            return alId
+        except: 
+            try:
+                alId = re.search("(?P<alId>(ins|inb)-\w+-[0-9]{2}-[0-9]{14}-[0-9]{1,4})", line).group('alId')
+                return alId
+            except:
+                try:
+                    alId = re.search("(?P<alId>(inb|ins)-\w+-\d\d-\d+-\d+)", line).group('alId')
+                    return alId
+                except:
+                    try:
+                        alId = re.search("(?P<alId>(inb|ins)-citi.*-[0-9]{2}-[0-9]{14}-[0-9a-z]+)", line).group('alId')
+                        return alId
+                    except:
+                        try:
+                            alId = re.search("(?P<alId>(inb|ins)-mastercard.*-[0-9]{2}-[0-9]{14}-[0-9a-z]+)", line).group('alId')
+                            return alId
+                        except:
+                            try:
+                                alId = re.search("(?P<alId>ins-\w+-[0-9]{2}-[0-9a-z]+)", line).group('alId')
+                                return alId
+                            except:
+                                try:
+                                    alId = re.search("(?P<alId>opstest-\w+-[0-9]{2}-[0-9]{14}-[0-9a-z]+)", line).group('alId')
+                                    return alId
+                                except:
+                                    return
+
+def extract_alertid(line):
+    try:
+        k = re.search("<alertid>(?P<alertId>(ins|inb)-\w+-[0-9]{14}-[0-9a-z]+)<\/alertid>", line).group('alertId')
+        return k
+    except: 
+        try:
+            k = re.search("<payloadid>(?P<alertId>(ins|inb)-\w+-[0-9]{14}-[0-9a-z]+)<\/payloadid>", line).group('alertId')
+            return k
+        except:
+            try:
+                k = re.search("<alertId>(?P<alertId>(ins|inb)-\w+-[0-9]{14}-[0-9a-z]+)<\/alertId>", line).group('alertId')
+                return k
+            except:
+                try:
+                    k = re.search("<content>(?P<alertId>(ins|inb)-\w+-[0-9]{14}-[0-9a-z]+)<\/content>", line).group('alertId')
+                    return k
+                except:
+                    try:
+                        k = re.search("(?P<alertId>inb-\w+-[0-9]{14}-[0-9a-z]+)",line).group('alertId')
+                        return k
+                    except:
+                        try:
+                            k = re.search("<payloadreference>(?P<alertId>(ins|inb)-\w+-[0-9]{14}-[0-9a-z]+)<\/payloadreference>", line).group('alertId')
+                            return k
+                        except:
+                            try:
+                                k = re.search("(?P<alertId>(inb|ins)-mastercard.*-[0-9]{14}-[0-9a-z]+)", line).group('alertId')
+                                return k
+                            except:
+                                try:
+                                    k = re.search("(?P<alertId>ins-\w+-[0-9]{14}-[0-9a-z]+)", line).group('alertId')
+                                    return  k
+                                except:
+                                    try:
+                                        k = re.search("(?P<alertId>(opstest)-\w+-[0-9]{14}-[0-9a-z]+)", line).group('alertId')
+                                        return  k
+                                    except:
+                                        return
+
+
+def find_alid_alertid(inputId, host, logs, dc, appName, print_to_console):
+    #This is the function called from the root level to kick off the AL ID log search
+    if len(appName) > 1:
+        pass
+    else:
+        if debug:
+            print  debugStr, "find_alid_alertid(): Missing or empty function argument"
+    #Container for alerts
+    alIds = []
+    alertIds = []
+            
+    for log in logs:
+
+        #Container for logs which are being written to a file
+        content = []
+        first_pass_raw_lines = []
+
+        ############################# FIRST PASS - Find the alId or alertId of the inputId #################################
+        # Finds both the alId and alertId or the script doesn't continue
+        context = 0
+        searchpattern = 0
+        
+        if debug:
+            print debugStr, "find_alid_alertid(): Find AlertIDs - Preparing grep command..."
+        
+        #Generate grep command
+        grepCmd = make_grepCmd(inputId, log, host, dc, searchpattern, context) 
+
+        if debug:
+            print debugStr, "find_alid_alertid(): Find AlertIDs - Searching for alertId using inputId"
+
+        with Spinner(beep=False, message="deriving AlertIds...."):
+            lines = run_proc(grepCmd, 'readlines')
+            for line in lines:
+                first_pass_raw_lines.append(line)
+
+        if debug: 
+            print debugStr, "Number of lines retrieved from grep: " + Fore.GREEN + str(len(first_pass_raw_lines))
+        # check appName exceptions and then construct and (escaped) pattern to use in upcoming grep
+        ## //////////////////////////////// NOT REALLY USED, INFORMATIONAL ONLY \\\\\\\\\\\\\\\\\\\\\\\\\\
+        
+        ## Look for alIds and alertIds in the grepped logs
+        for line in first_pass_raw_lines:
+            alId=extract_alid(line)
+            alertId=extract_alertid(line)
+            #print "LINE"
+            #print alId
+            if alId not in alIds and alId != None:
+                print "ADL ID Found:\t" + str(alId)
+                alIds.append(alId)
+            #print alertId
+            if alertId not in alertIds and alertId != None:
+                print "AlertID Found:\t" + str(alertId)
+                alertIds.append(alertId)
+
+        # regex = set_re_match(appName)
+        # if debug:
+        #     pass
+        #     #print debugStr, "Regex used:" + str(regex)
+        #     print debugStr, "Regex match attempt result 1" + str(search_list_by_single_regex_pattern(regex, 1, first_pass_raw_lines))
+        #     print debugStr, "Regex match attempt result 2" + str(search_list_by_single_regex_pattern(regex, 2, first_pass_raw_lines))
+        
+        # # Check for match in al log file, break after first match
+        # lines_matching_regex_list=dedupe_list(search_list_by_single_regex_pattern(regex, 1, first_pass_raw_lines))
+
+        if debug:
+            print debugStr, "Total AL IDs found: " + str(len(alIds))
+            print debugStr, "Total Alert IDs found: " + str(len(alertIds))
+        
+        ## //////////////////////////////// NOT REALLY USED, INFORMATIONAL ONLY \\\\\\\\\\\\\\\\\\\\\\\\\\
+
+        #Were lines found? If not goto the next log
+        if first_pass_raw_lines and first_pass_raw_lines != None or first_pass_raw_lines != '' and len(first_pass_raw_lines) > 0:
+            pass
+            #print "Grep returned lines"
+            # # Search for a line containing both IDs
+            # try:
+            #     for line in first_pass_raw_lines:
+            #         try:
+            #             alId=extract_alid(line)
+            #             alertId=extract_alertid(line)
+            #             if debug and (len(alId) > 0 and len(alertId) > 0):
+            #                 print debugStr, "find_alid_alertid(): ALERTID:" + alertId
+            #                 print debugStr, "find_alid_alertid(): ADL ID:" + alId
+            #             elif len(alId) > 0 and len(alertId) > 0:
+            #                 print debugStr, "find_alid_alertid(): ADL ID:\t\t " + alId.strip()
+            #                 print debugStr, "find_alid_alertid(): ALERTID:\t " + alertId.strip()
+            #             elif len(alId) > 0 and len(alertId) == 0:
+            #                 print debugStr, "find_alid_alertid(): ADL ID:\t\t" + alId.strip()
+            #                 print debugStr, "find_alid_alertid(): ALERTID:\t <empty>"
+            #             elif len(alId) == 0 and len(alertId) > 0:
+            #                 print debugStr, "find_alid_alertid(): ADL ID:\t\t <empty>"
+            #                 print debugStr, "find_alid_alertid(): ALERTID:\t " + alertId.strip()
+            #             else:
+            #                 exit("Fallback error. Check find_alid_alertid()")
+            #             #only retrieve unique alerts
+            #             if alId not in alIds:
+            #                 if debug:
+            #                     print debugStr, "find_alid_alertid(): Adding new alId: " + alId
+            #                 alIds.append(alId)
+            #             if alertId not in alertIds:
+            #                 alertIds.append(alertId)
+            #                 if debug:
+            #                     print debugStr, "find_alid_alertid(): Adding new alertId: " + alertId
+            #                 #return (alId, alertId)
+            #         except:
+            #             continue
+            # except:
+            #     (alId, alertId) = retrieve_ids("\n".join(lines_matching_regex_list))
+            #     if debug and (len(alId) > 0 and len(alertId) > 0):
+            #         print debugStr, "find_alid_alertid(): ALERTID:" + alertId
+            #         print debugStr, "find_alid_alertid(): ADL ID:" + alId
+            #     elif len(alId) > 0 and len(alertId) > 0:
+            #         print debugStr, "find_alid_alertid(): ADL ID:\t\t " + alId.strip()
+            #         print debugStr, "find_alid_alertid(): ALERTID:\t " + alertId.strip
+            #     elif len(alId) > 0 and len(alertId) == 0:
+            #         print debugStr, "find_alid_alertid(): ADL ID:\t\t " + alId.strip()
+            #         print debugStr, "find_alid_alertid(): ALERTID: <empty>"
+            #     elif len(alId) == 0 and len(alertId) > 0:
+            #         print debugStr, "find_alid_alertid(): ADL ID:\t\t <empty>"
+            #         print debugStr, "find_alid_alertid(): ALERTID:\t " + alertId.strip()
+            #     else:
+            #         exit("Fallback error. Check find_alid_alertid()")
+            #     if alId not in alIds:
+            #         print debugStr, "find_alid_alertid(): Adding new alId: " + alId
+            #         alIds.append(alId)
+            #     if alertId not in alertIds:
+            #         print debugStr, "find_alid_alertid(): Adding new alertId: " + alertId
+            #         alertIds.append(alertId)
+        else: 
+            if debug:
+                print warnStr, "find_alid_alertid(): Error, no matching AL logs were found in " + log
+            #continue
+ 
+    #Send back a list of alIds and alertIds so that other functions can run
+    if len(alIds) > 0 or len(alertIds) > 0:
+        #Report search findings
+        if debug:
+            print debugStr, "find_alid_alertid(): Unique alIds found: \t" + Fore.YELLOW + str(len(alIds))
+            print debugStr, "find_alid_alertid(): Unique alertIds found: \t" + Fore.YELLOW + str(len(alertIds))        
+        return (alIds, alertIds)
+    else:
+        if debug:
+            print warnStr, "find_alid_alertid(): No alIds or alertIds found.."
+        return [], []
+
+# Checks for apm host, checks access, then looks through logs
+def find_alertids_by_caseid(caseId,ccsEnv):
+    apmLines = []
+    rulesHit = []
+    
+    # Split ID into component parts
+    idDict = split_id(caseId)
+    appName = idDict['name']
+    logDate = idDict['year'] + '-' + idDict['month'] + '-' + idDict['day']
+    
+    (logsOnStorage, today)=are_logs_on_storage(logDate, ccsEnv, 'adl')
+    
+    apmName = appName.lower()
+    
+    if not logsOnStorage:
+        apmHostName = apmName + '-apm-' + ccsEnv + '.' + ccsGlobal
+        apmLogDir = '/opt/wf/log/'
+        #try:
+        #    dc = determine_dc(apmHostName)
+        #except:
+        #    if debug:
+        #        print 'Could not identify alHost or Datacenter in CQA'
+    else:
+        apmHostName = apmName + '-apm-' + ccsEnv + '.' + ccsGlobal
+        apmLogDir = '/mnt/archive/archiver/A7APM/*/opt/wf/log/'
+    # Determine if APM host cname exists:
+    try:
+        socket.gethostbyname(apmHostName)
+    except:
+        exit('Could not find hostname: ' + apmHostName)
+    if not quiet:
+        print 'APM Host:\t' + apmHostName
+
+    # Check we can reach host over ssh
+    
+    if check_host_port(apmHostName, 22) != 0:
+        print warnStr + 'Cannot connect to apm over ssh: ' \
+            + apmHostName
+        print warnStr + 'Are you running this from a Bastion host?'
+        return
+    
+    #Check each APM Log location and find alertIds
+    apmLogDir = '/opt/wf/log/'
+    apmLogName = 'apm2' + apmName + '.log'
+    apmLog = apmLogDir + apmLogName
+    apmCmd = 'ssh ' + apmHostName \
+        + ' "nice grep -oP \'postPayloadStarted.*' + caseId \
+        + ".*alertId=\K(.*)'" + ' ' + apmLog + '"'
+           # check todays log first
+    if debug:
+        print debugStr, '[1/4] Alert IDs not found in APM logs: ' + apmLogName
+        print debugStr, 'Expanding search to log date days on APM host.'
+    if debug:
+        print debugStr, 'APM CaseID FindCmd:', apmCmd
+    with Spinner(beep=False, message="collecting apm logs...."):
+        apmLines = run_proc(apmCmd).stdout.readlines()
+    if len(apmLines) > 0:
+        for line in apmLines:
+            print 'ALERT ID: ', line.rstrip()
+        return apmLines
+    
+    # check the logdate of the apm case ID second
+    if debug:
+        print debugStr, '[2/4] Alert IDs not found in APM logs: ' + apmLogName
+        print debugStr, 'Expanding search to other days on APM host.'
+    apmLogDir = '/opt/wf/log/'
+    apmLogName = 'apm2' + apmName + '.log.' + logDate
+    apmLog = apmLogDir + apmLogName
+    apmCmd = 'ssh ' + apmHostName \
+        + ' "nice zgrep -oP \'postPayloadStarted.*' + caseId \
+        + ".*alertId=\K(.*)'" + ' ' + apmLog + '"'
+    if debug:
+        print debugStr, 'APM CaseID FindCmd:', apmCmd
+    with Spinner(beep=False, message="collecting apm logs...."):
+        apmLines = run_proc(apmCmd).stdout.readlines()
+    if len(apmLines) > 0:
+        for line in apmLines:
+            print 'ALERT ID: ', line.rstrip()
+        return apmLines
+    else:
+        # check all logs on APM host third
+        
+        if debug:
+            print debugStr, '[3/4] Alert IDs not found in APM logs: ' + apmLogName
+            print debugStr, 'Expanding search to all logs on APM host.'
+        apmLogDir = '/opt/wf/log/'
+        apmLogName = 'apm2' + apmName + '.log'
+        apmLog = apmLogDir + apmLogName
+        apmCmd = 'ssh ' + apmHostName \
+            + ' "nice zgrep -oP \'postPayloadStarted.*' + caseId \
+            + ".*alertId=\K(.*)'" + ' ' + apmLog + '*' + '"'
+        if debug:
+            print debugStr, 'APM CaseID FindCmd:', apmCmd
+        with Spinner(beep=False, message="collecting apm logs...."):
+            apmLines = run_proc(apmCmd).stdout.readlines()
+        if len(apmLines) > 0:
+            for line in apmLines:
+                print 'ALERT ID: ', line.rstrip()
+            return apmLines
+        else:
+            
+            # check logs on storage host fourth
+            
+            if debug:
+                print debugStr, '[4/4] Alert IDs not found in APM logs: ' + apmLogName
+                print debugStr, 'Expanding search to all logs on Storage host.'
+                
+            apmLogDir = '/mnt/archive/archiver/A7APM/*/opt/wf/log/'
+            apmLogName = 'apm2' + apmName + '.log'
+            apmLog = apmLogDir + apmLogName
+            apmCmd = 'ssh ' + 'storage.' + dc \
+                + ' "zgrep -oP \'postPayloadStarted.*' + caseId \
+                + ".*alertId=\K(.*)'" + ' ' + apmLog + '*' + '"'
+            if debug:
+                print debugStr, 'APM CaseID FindCmd:', apmCmd
+            with Spinner(beep=False, message="analyzing apm logs...."):
+                apmLines = run_proc(apmCmd).stdout.readlines()
+            if len(apmLines) > 0:
+                for line in apmLines:
+                    print 'ALERT ID: ', line.rstrip()
+                return apmLines
+            else:
+                print 'No alerts found in', ccsEnv
+    return apmLines
+
+    
+###############################################################
+#
+#                   DETERMINE HOST FUNCTIONS
+#
+###############################################################
+
+def determine_dc(alHost):  # Determine host type from /etc/motd
+    motd = '/etc/motd'
+    
+    # dcCmd = "grep -oP 'Location    : \K\w+' " + motd
+    
+    dcCmd = 'ssh ' + alHost + " \"grep -oP 'Location    : \K\w+' " \
+        + motd + '"'
+    dc = run_proc(dcCmd).stdout.read().rstrip().lower()
+    if debug:
+        print debugStr, 'Detected logs are in Datacenter: ', dc
+    return dc
+
+
+def determine_host():  # Determine host type from /etc/motd
+    motd = '/etc/motd'
+    hostRole = 'bastion'  # Default is bastion
+    hostRoleCmd = "grep -E '.\*.*\ {2}' " + motd
+    p = run_proc(hostRoleCmd, 'readlines')
+    for line in p:
+        if re.match('.*Bastion.*', line):
+            hostRole = 'bastion'
+        elif re.match('.*Storage.*', line):
+            hostRole = 'storage'
+        elif re.match('.*A[dD][eL].*', line):
+            hostRole = 'al'
+        elif re.match('.*A7 APM.*', line):
+            hostRole = 'apm'
+        elif re.match('.*A7 Alert Executor.*', line):
+            hostRole = 'ae'
+    if script and not today:
+        hostRole = 'script-mode'
+    if not quiet:
+        if not script and debug:
+            print debugStr, 'Detected we are running on [' + hostRole + ']'
+    return hostRole
+
+def host_moved(host, date):
+    host = host.strip('.')
+    
+    for move_id, move_info in service_moved.items():
+        try:
+            s_id = move_id
+            cname = service_moved[move_id]['cname'].strip().strip('.')
+            moved_on = service_moved[move_id]['moved_on'].strip()
+            old_host = service_moved[move_id]['old'].strip().strip('.')
+            new_host = service_moved[move_id]['new'].strip().strip('.')
+            
+            requested_t = datetime.datetime.strptime(date, '%Y-%m-%d').date()
+            moved_on_t = datetime.datetime.strptime(moved_on, '%Y-%m-%d').date()
+            today_t = datetime.date.today()
+        except:
+            print debugStr, "host_moved(): Unable to assign variables due to exception"
+            continue
+        if len(cname) > 0 and len(moved_on) > 0:
+            if socket.getfqdn(host) in socket.getfqdn(cname):
+                if debug: 
+                    print debugStr, "host_moved(): Found matching host migration. A migration of " + str(old_host) + " -> " + str(new_host) + " took place on " + str(moved_on)
+                    print debugStr, "host_moved(): Log Requested: " + str(requested_t.strftime('%Y-%m-%d'))
+                    print debugStr, "host_moved(): Service Moved on: " + str(moved_on_t.strftime('%Y-%m-%d'))
+                    print debugStr, "host_moved(): Today is: " + str(today_t.strftime('%Y-%m-%d'))
+                    
+                if (cname.endswith('global.adeptra.com') and host.endswith('global.adeptra.com') or host.endswith('hosts.adeptra.com')):
+                        if str(moved_on) == str(time.strftime('%Y-%m-%d')):
+                            if debug:
+                                print debugStr, "host_moved(): Migration of " + str(cname) + " took place today. Using new host"
+                                return new_host
+                        elif (moved_on_t > requested_t):
+                            if debug:
+                                print debugStr, "host_moved(): Migration of " + str(cname) + " takes place in the future on " + str(moved_on) + ". Using existing host"
+                            return old_host
+                        elif (moved_on_t < requested_t):
+                            if debug:
+                                print debugStr, "host_moved(): Migration of " + str(cname) + " took place on " + str(moved_on_t.strftime('%Y-%m-%d')) + ". Using new host"
+                            return new_host
+                else:
+                    if debug:
+                        print warnStr, "host_moved(): Error: host type is unexpected. Returning original host"
+                    return host
+            else:
+                if debug:
+                    print debugStr, "host_moved(): Check passed." 
+                continue               
+        else:
+            if debug:
+                print debugStr, "host_moved(): Missing CNAME or Moved_on Date"
+            continue
+    if debug:
+        print debugStr, "host_moved(): A host migration was not defined, using DNS.."
+    return host
+                
+###############################################################
+#
+#                   RETRIEVE LOG FUNCTIONS
+#
+###############################################################
+
+def identify_log_location(host,logName, storage,service_type):
+    datacenter=determine_dc(host)
+    # Create appropriate find command
+    findCmd = make_a7findCmd(host, logName, storage)
+    if debug:
+        print debugStr, "identify_log_location(): Building " + service_type + " Find Command: " + findCmd
+    # Find logs # logLocations = ['firstlocation', 'secondlocation']
+    with Spinner(beep=False, message="finding " + service_type + " logs...."):
+        logs = run_proc(findCmd).stdout.readlines()
+    if debug:
+        print debugStr, "identify_log_location(): " + service_type + "Find Command Results: " + str(logs)
+
+    if len(logs) == 0:
+        if storage == 1:
+            storage = 0
+        else: 
+            storage = 1
+        findCmd = make_a7findCmd(host, logName, storage)
+        with Spinner(beep=False, message="finding " + service_type + " logs...."):
+            logs = run_proc(findCmd).stdout.readlines()
+        if debug:
+            print debugStr, "identify_log_location(): Find Command Results: " + str(logs)
+    if len(logs) == 0:
+        print warnStr, "identify_log_location(): Error, logs were not found on the service host or storage host"
+        logs = []
+        return logs, datacenter
+    return logs, datacenter
+
+
+def make_findCmd(findName, alHost, logsOnStorage):
+    if logsOnStorage == 0:
+        findCmd = 'ssh ' + alHost + ' "find /opt/adl/' + findName \
+            + '* /opt/adeptralink/al2_' + findName + '* -iname ' \
+            + findLog + ' -type f 2>/dev/null"'
+    else:
+        findCmd = 'ssh ' + 'storage.' + dc + ' "find ' \
+            + storageBaseDir + '/ADL/*/opt/adl/' + findName + '* ' \
+            + storageBaseDir \
+            + '/AdeptraLink/*/opt/adeptralink/al2_' + findName \
+            + '* -iname ' + findLog + ' -type f 2>/dev/null"'
+    return findCmd
+
+
+
+def make_a7findCmd(a7Host, logName, logsOnStorage):
+    #get FQDN
+    a7Hostfqdn = socket.getfqdn(a7Host.rstrip('.'))
+    a7HostAlias = getAlias(a7Hostfqdn)
+    if a7HostAlias == False:
+        if debug:
+            print warnStr, "Host Alias was not found for " + a7Hostfqdn
+        a7HostAlias = a7Hostfqdn
+    if debug:
+        print debugStr, "Host FQDN: " + a7Hostfqdn
+        print debugStr, "Host Alias: " + str(a7HostAlias)
+    #Remove .hosts.adeptra.com from the end
+    a7Host_short = re.sub('.hosts.adeptra.com', '', str(a7HostAlias))
+    a7Host_short = re.sub("'", '', str(a7Host_short))
+    if debug: 
+        print debugStr, "Host Shortname: " + str(a7Host_short)
+    #print a7Host_short
+    dc = determine_dc(a7Host_short)
+    #determine_host()
+    if logsOnStorage:
+        findCmd = 'ssh ' + 'storage.' + dc + ' "find ' + storageBaseDir + '/A7Service/' + a7Host_short + '/opt/wf/log/' + ' -iname ' + logName + ' -type f 2>/dev/null"' 
+    else:
+        findCmd = 'ssh ' + a7Host_short + ' "find /opt/wf/log/ -iname ' + logName + ' -type f 2>/dev/null"'
+    
+    return findCmd
+
+def make_grepCmd(inputId, logfile, host, dc, searchpattern, context, alertId=None):
+    if context == 0:
+        contextCmd = " "
+    else:
+        contextCmd = " -C" + str(context) + " "
+    
+    if searchpattern and context == 0:
+        if debug:
+            print debugStr, "make_grepCmd(): Searching log by custom search pattern, and capturing 0 surrounding lines."
+        pattern = searchpattern
+        command = 'zgrep' + str(contextCmd) + '-E ' + str(pattern) + ' ' + logfile
+    elif searchpattern and context > 0:
+        if debug:
+            print debugStr, "make_grepCmd(): Searching log by custom search pattern, and capturing " + str(context) + " surrounding lines"
+        pattern = searchpattern
+        command = 'zgrep' + str(contextCmd) + '-E ' + str(pattern) + ' ' + logfile
+    elif (searchpattern == 0 and context == 0) and (inputId and alertId and len(alertId) > 5 ):
+        if debug:
+            print debugStr, "make_grepCmd(): Searching log by AL ID + Alert ID. No search pattern, and capturing " + str(context) + " surrounding lines"
+        pattern = "'(" + strip(inputId) + '|' + strip(alertId) + ")'"
+        command = 'zgrep' + str(contextCmd) + '-E ' + str(pattern) + ' ' + logfile
+    elif inputId and alertId and len(alertId) > 5 and context and len(searchpattern) == 0:
+        if debug:
+            print debugStr, "make_grepCmd(): Searching log for AL ID + Alert ID, and capturing" + str(context) + " surrounding lines"
+        pattern = "'(" + strip(inputId) + '|' + strip(alertId) + ")'"
+        command = 'zgrep' + str(contextCmd) + '-E ' + str(pattern) + ' ' + logfile
+    elif inputId:
+        if debug:
+            print debugStr, "make_grepCmd(): Searching log for AL ID only."
+        pattern = strip(inputId)
+        command = 'zgrep -F ' + "'" + str(pattern) + "'" + ' ' + logfile
+    else:
+        if debug:
+            print warnStr, "make_grepCmd(): ERROR: inputId, alertId, or context not defined"
+        #pattern = strip(inputId)
+        #command = 'zgrep -F ' + '"' + pattern + '"' + ' ' + logfile
+        return
+    #strip whitespace out
+    command = strip(command)
+    #Check which type of host we're running this from, in order to finish building the grep commmand
+    if not logsOnStorage:
+        grepCmd = 'ssh ' + host + ' " ' + command + ' " '
+    else:
+        grepCmd = 'ssh ' + 'storage.' + dc + ' " ' + command + ' " '
+    if debug:
+        print debugStr, 'make_grepCmd(): final grep command: ' + grepCmd
+    return grepCmd
+
+
+def make_caseExplorerCmd(hostName, apmCaseid, logfile):
+    try:
+        filename = os.path.basename(logfile)
+        dirname = os.path.dirname(logfile)
+    except:
+        print warnStr, "Exception deriving APM Log file and dir"
+
+    if logsOnStorage:
+        caseExplorerCmd = 'ssh ' + 'storage.' + dc + ' " cd ' + dirname + ';' + apmCaseExplorer + ' -c ' + apmCaseid + ' -f ' + filename + '"'
+    else:
+        caseExplorerCmd = 'ssh ' + hostName + ' " cd ' + dirname + ';' + apmCaseExplorer + ' -c ' + apmCaseid + ' -f ' + filename + '"'                
+
+    if debug:
+        print debugStr, 'CaseExplorer command: ' + caseExplorerCmd
+    return caseExplorerCmd
+
+def make_a7SearchCmd(hostName, alertId, logfile, datacenter, logsOnStorage,context):
+    try:
+        filename = os.path.basename(logfile)
+        dirname = os.path.dirname(logfile)
+    except:
+        print warnStr, "Exception deriving A7 Log file and dir"
+    
+    if context == 0:
+        contextCmd = ""
+    else:
+        contextCmd = " -C" + str(context) + " "
+
+    if not logsOnStorage:
+        logSearchCmd = 'ssh ' + hostName + ' "zgrep -a ' + contextCmd + ' -F ' + alertId + ' ' + dirname + '/'+ filename + '"'
+    else:
+        logSearchCmd = 'ssh ' + 'storage.' + datacenter + ' "zgrep -a ' + contextCmd + ' -F ' + alertId + ' ' + dirname + '/' + filename + '"'
+    if debug:
+        print debugStr, 'A7 Log Search command: ' + logSearchCmd
+    return logSearchCmd
+    
+def get_logs(findCmd):
+    #if debug:
+    #    print findCmd
+    with Spinner(beep=False, message="finding logs...."):
+        logs = run_proc(findCmd, 'readlines')
+    expandFind = 0
+    for log in logs:
+    
+    # If no logs found for the provided input
+        
+        if len(log) == 0:
+            if not quiet:
+                print warnStr + 'No logs found'
+                print warnStr + 'Find command: ' + findCmd
+            
+            # Check if this is a citi app
+            
+        #    if 'citi' in appName and expandFind == 0:
+        #        expandFind = 1
+        #        findName = 'citi'
+        #        if not quiet:
+        #            print warnStr + 'Detected Citi app, expanding find'
+        #        findCmd = make_findCmd(findName)
+        #        with Spinner("\t\t\t\t... finding logs "):
+        #            logs = run_proc(findCmd, 'readlines')
+        #    elif 'bmw' in appName and expandFind == 0:
+        #        expandFind = 1
+        #        findName = 'bmw'
+        #        if not quiet:
+        #            print warnStr + 'Detected BMW app, expanding find'
+        #        findCmd = make_findCmd(findName)
+        #        with Spinner("\t\t\t\t... finding logs "):
+        #            logs = run_proc(findCmd, 'readlines')
+    return logs
+
+
+def check_name_exception(appName):
+    if 'mastercard' in appName:
+        findName = 'mastercard'
+    elif 'citibankUSFraudRiskManagementRPL' in appName:
+        findName = 'citibankUSFRMRPL'
+    else:
+        findName = appName
+    return findName
+
+
+def check_log_date(today, logDate, service_type):
+    if today:
+        findLog = service_filename[service_type]
+    else:
+        findLog = service_filename[service_type] + '.' + logDate + '*'
+    return findLog
+
+
+
+def get_apm_rules(apmLines, expanded_search):
+    allContent = []
+    for line in apmLines:
+        if 'ruleAuditInputCompleted' in line:
+            if debug:
+                #print debugStr , 'ruleAudit line: ' + line
+                allContent.append(line)
+            rules = line.split('RuleMatch')
+            for rule in rules:
+            # Filter out first split, i.e prior to any rule
+                
+                if not re.match('^\d{4}-\d{2}-\d{2}.*', rule):
+                    
+                    # Filter out the first split, already printed above
+                    
+                    if not re.match('.*GOTO_PORT.*', rule):
+                        
+                        # Filter out the line that repeats the portfolio name
+                        
+                        if not re.match('^\s.*', rule):
+                            val = '--RuleMatch' + rule.split(',')[0].split('Cond')[0].rstrip(',')
+                            #print val
+                            allContent.append(val)
+                            # If expanded_search, print out full rule information
+                            if expanded_search:
+                                val = '---Condition(s)' \
+                                    + rule.split('Condition(s)'
+                                        )[1].split('Action'
+                                        )[0].rstrip(',')
+                                #print val
+                                allContent.append(val)
+                                if 'GOTO_STRATEGY' not in rule:
+                                    val = '----Action(s)' + rule.split('Action(s)')[1].rstrip(',')
+                                    #print val
+                                    allContent.append(val)
+                    else:
+                        if 'GOTO_STRATEGY' not in rule:
+                            val = 'GOTO_PORTFOLIO' + rule.split(',')[0]
+                            #print val
+                            allContent.append(val)
+                    if 'GOTO_STRATEGY' in rule:
+                        val = 'GOTO_S' + rule.split('GOTO_S')[1].split(';')[0]
+                        #print val
+                        allContent.append(val)
+                else:
+                    val = '\nDatestamp: ' + rule.split(',')[0]
+                    allContent.append(val)
+                    val = 'Rules hit:'
+                    allContent.append(val)
+    return allContent
+
+def are_logs_on_storage(date, ccsEnv, logtype):
+    today = 0
+    try:
+        logDate = date    
+        log_t = datetime.datetime.strptime(logDate, '%Y-%m-%d').date()
+        today_t = datetime.date.today()
+        if logtype == "apm":
+            rollover_t = (datetime.datetime.now() - datetime.timedelta(days=3)).date()
+        else:
+            rollover_t = (datetime.datetime.now() - datetime.timedelta(days=3)).date()
+        
+        rollover_cqa_t = (datetime.datetime.now() - datetime.timedelta(days=30)).date()
+        if logDate == time.strftime('%Y-%m-%d'):
+            today = 1
+    except:
+        print 'are_logs_on_storage(): ERROR Parsing alert / log date, exiting...'
+    if debug:
+        print debugStr, 'are_logs_on_storage(): AppName: ', idDict['name']
+        print debugStr, 'are_logs_on_storage(): Alert Date: ', logDate
+        print debugStr, 'are_logs_on_storage(): Log Rollover Date: ', \
+            rollover_t.strftime('%Y-%m-%d')
+        print debugStr, 'are_logs_on_storage(): Today Is: ', today_t.strftime('%Y-%m-%d')
+    if ccsEnv == 'cqa':
+        if debug:
+            print 'are_logs_on_storage(): CQA Environment, Logs on host'
+        logsOnStorage = 0
+        return (logsOnStorage, today)
+    
+    # Define logsOnStorage Global
+    #print debugStr, "log_t: " + str(log_t.strftime('%Y-%m-%d'))
+    #print debugStr, "rollover_t: " + str(rollover_t.strftime('%Y-%m-%d'))
+    
+    if log_t <= rollover_t:
+        if debug:
+            print debugStr, 'are_logs_on_storage(): Logs have rolled over to Storage'
+        logsOnStorage = 1
+    elif rollover_t.strftime('%Y-%m-%d') == logDate:
+        logsOnStorage = 1
+    else:
+        logsOnStorage = 0
+    
+    #print debugStr, "logsOnStorage: " + str(logsOnStorage)
+    
+    return (logsOnStorage, today)
+     
+
+###############################################################
+#
+#                   CNAME FUNCTIONS
+#
+###############################################################
+
+def which_processing_cluster(alertId, environment):
+    #Query DWH Global DB 
+    if debug:
+        print debugStr, "Executing DWH Global Query..." 
+    with Spinner(beep=True, message="querying global DWH database...."):
+        (processing_cluster, dwh_slave)=query_all_dwhglobal(environment,alertId)
+    if debug:
+        print debugStr , "Processing cluster search result: " + "{}".format(processing_cluster) + " on DWH Database: " + dwh_slave
+    if len(processing_cluster) > 0:
+        return processing_cluster, dwh_slave
+    else:
+        return None,None
+        
+    #aeProcessingClusterCmd = alertid2Processing + ' ' + alertId
+    #if debug:
+    #    print debugStr, "Find Processing Cluster Command: " + aeProcessingClusterCmd
+    #with Spinner(beep=False, message="querying global DWH database...."):
+    #    lines = run_proc(aeProcessingClusterCmd).stdout.readlines()
+    #if debug:
+    #    print debugStr , "Processing cluster search result (" + str(len(lines)) + "): " + str(lines)
+    #if len(lines) > 0:
+    #    for line in lines:
+    #        split_string = lines[0].split("\t")
+    #        processingCluster = split_string[0].strip()
+    #        #datacenter = split_string[1].strip()
+    #        #environment = split_string[2].strip()
+    #        dwhSlave = split_string[1].strip().rstrip('.')
+    #        if debug:
+    #            print debugStr , "Processing Cluster:\t\t" + processingCluster
+    #            #print debugStr , "Datacenter:\t\t\t" + datacenter
+    #            #print debugStr , "Environment:\t\t" + environment
+    #            print debugStr , "DWH Slave:\t\t\t" + dwhSlave
+    #        if debug:
+    #            print "PROC CLUSTER: \t" + processingCluster
+    #            print "DWH SLAVE: \t" + dwhSlave
+    #            #print "ENVIRONMENT: \t" + environment
+    #        return processingCluster, dwhSlave
+    #else:
+    #    print "Error: No processing cluster could be identified [using the alert2processing script].\n " + Fore.YELLOW + "- Has the alert been inserted into the DWH yet?\n" + Style.RESET_ALL + " \n- Are you running this from a DMS host?\n- Can you connect to the DWH Global DB from this host?\n - Can you login to the DWH Global DB with mysql --login-path=report -h <database host>? \n If not, then run mysql_config_editor set --login-path=report --user=report --password and enter the report Mysql credentials from SysPass"
+    #    return None,None
+
+def get_al(appName, environment):
+    # Determine al host
+    cfindCmd = '/opt/sysadmin/bin/cnameFind ^' + appName + '-ad?l-' \
+        + environment + "| awk '{ print $1 }' | head -n 1"
+    if debug:
+        print debugStr , 'cnameFind: ' + cfindCmd
+    alHost = run_proc(cfindCmd).stdout.read().rstrip()
+    alHostfqdn = socket.getfqdn(alHost.rstrip('.'))
+    if alHost == '':
+        # Check for exception ( CitibankUSFraudRiskManagementRPL )
+        if appName == 'citibankUSFraudRiskManagementRPL':
+            alHost = 'citibankusfrmrpl-adl-' + environment + '.global.adeptra.com'
+        else:
+            exit('FATAL: Cannot determine host for name: ' + appName)
+    if not quiet:
+        print '\nADL Host:\t' + alHost.rstrip('.') + ' -> ' + alHostfqdn
+    return alHost
+
+
+def get_ae(processingClusterName,ccsEnv):
+    # Determine al host
+    cfindCmd = "/opt/sysadmin/bin/cnameFind '^alertexecutor2{0,1}-" + processingClusterName + '.' \
+        + ccsEnv + "' " + " | awk '{ print $1 }' | head -n 5"
+    if debug:
+        print debugStr , 'cnameFind: ' + cfindCmd
+    aeHosts = run_proc(cfindCmd).stdout.readlines()
+    aeHostsfqdn = []
+    for host in aeHosts:
+        aeHostfqdn = socket.getfqdn(host.strip().rstrip('.'))
+        if debug:
+            print debugStr, "Adding AE host: " + aeHostfqdn
+        aeHostsfqdn.append(aeHostfqdn)
+    
+    if len(aeHostsfqdn) > 0:
+        if debug:
+            print debugStr , "Found " + str(len(aeHostsfqdn)) + " alertExecutor Hosts to check for this alert"
+    else:
+        exit("FATAL: Cannot determine AlertExecutor host(s)")
+        
+    return aeHostsfqdn
+
+def get_sms(dc,ccsEnv):
+    # Determine SMS host
+    dc_short = dc[:2]
+    cfindCmd = "/opt/sysadmin/bin/cnameFind '^sms-[a-z]+\." + ccsEnv + '\.' + dc_short + "' " + " | awk '{ print $1 }'"
+    if debug:
+        print debugStr , 'cnameFind: ' + cfindCmd
+    smsHosts = run_proc(cfindCmd).stdout.readlines()
+    smsHostsfqdn = []
+    for host in smsHosts:
+        smsHostfqdn = socket.getfqdn(host.strip().rstrip('.'))
+        if smsHostfqdn not in smsHostsfqdn:
+            if debug:
+                print debugStr, "Adding SMS host: " + smsHostfqdn
+            smsHostsfqdn.append(smsHostfqdn)
+        else:
+            if debug:
+                print debugStr, "Skipping duplicate SMS host: " + smsHostfqdn
+    
+    if len(smsHostsfqdn) > 0:
+        if debug:
+            print debugStr , "Found " + str(len(smsHostsfqdn)) + " SMS Hosts to check for this alert"
+    else:
+        exit("FATAL: Cannot determine sms host(s)")
+    return smsHostsfqdn
+
+def get_email(dc,ccsEnv):
+    # Determine SMS host
+    dc_short = dc[:2]
+    cfindCmd = "/opt/sysadmin/bin/cnameFind '^email-[a-z]+\." + ccsEnv + '\.' + dc_short + "' " + " | awk '{ print $1 }' | head -n 1"
+    if debug:
+        print debugStr , 'cnameFind: ' + cfindCmd
+    emailHosts = run_proc(cfindCmd).stdout.readlines()
+    emailHostsfqdn = []
+    for host in emailHosts:
+        emailHostfqdn = socket.getfqdn(host.strip().rstrip('.'))
+        if emailHostfqdn not in emailHostsfqdn:
+            if debug:
+                print debugStr, "Adding Email host: " + emailHostfqdn
+            emailHostsfqdn.append(emailHostfqdn)
+        else:
+            if debug:
+                print debugStr, "Skipping duplicate Email host: " + emailHostfqdn
+    if len(emailHostsfqdn) > 0:
+        if debug:
+            print debugStr , "Found " + str(len(emailHostsfqdn)) + " Email Hosts to check for this alert"
+    else:
+        exit("FATAL: Cannot determine Email host(s)")
+        
+    return emailHostsfqdn
+    
+
+def get_smsinb(dc,ccsEnv):
+    
+    # Determine SMS host
+    dc_short = dc[:2]    
+    cfindCmd = "/opt/sysadmin/bin/cnameFind '^smsinbound-[a-z]+\." + ccsEnv + '\.' + dc_short + "' " + " | awk '{ print $1 }' | head -n 1"
+    if debug:
+        print debugStr , 'cnameFind: ' + cfindCmd
+    smsinbHosts = run_proc(cfindCmd).stdout.readlines()
+    smsinbHostsfqdn = []
+    for host in smsinbHosts:
+        smsinbHostfqdn = socket.getfqdn(host.strip().rstrip('.'))
+        if smsinbHostfqdn not in smsinbHostsfqdn:
+            if debug:
+                print debugStr, "Adding SMS Inbound host: " + smsinbHostfqdn
+            smsinbHostsfqdn.append(smsinbHostfqdn)
+        else:
+            if debug:
+                print debugStr, "Skipping duplicate SMS host: " + smsinbHostfqdn
+
+    if len(smsinbHostsfqdn) > 0:
+        if debug:
+            print debugStr , "Found " + str(len(smsinbHostsfqdn)) + " SMS Inbound Hosts to check for this alert"
+    else:
+        exit("FATAL: Cannot determine SMS Inbound host(s)")
+        
+    return smsinbHostsfqdn
+
+def get_voice(alertId, function, environment, datacenter, queue):
+        if debug:
+            print debugStr, "get_voice(): Called collect_voice_logs for " + datacenter
+            info('function get_voice')
+        output=collect_voice_logs(alertId, environment, datacenter, function)
+        if output != None and len(output) > 0:
+            for line in output:
+                q_writer(queue, line)
+            if debug:
+                print debugStr, "Writing DONE signal to the queue for " + datacenter + " " + function
+            queue.put('DONE')
+            #queue.put(output)
+
+def find_adl_identifiers(alId, alertId, host, log, dc, context, identifier_regexes, identifiers_list=None):
+    ############################# IDENTIFIER SEARCH - Find identifiers associated with the alID, alertId, or both #################################
+    # Finds key identifiers listed in secondary_identifiers_regex_list
+    # input: alId , alertId, or both
+    # output: unique_identifiers_list
+    content = []
+    raw_lines = []
+    #if no identifiers were supplied, assume no search pattern - this will query by alId or alertId or both
+    if identifiers_list == None:
+        searchpattern = 0 #"'(" + alId + '|' + alertId + ")'"
+        if debug:
+            print debugStr, "find_adl_identifiers(): Searching without identifiers defined.."
+            print debugStr, "find_adl_identifiers(): alID: " + str(alId) 
+            print debugStr, "find_adl_identifiers(): alertID: " + str(alertId)
+            print debugStr, "find_adl_identifiers(): Preparing grep command... "
+    else:
+        searchpattern = convert_list_to_grep_filter(identifiers_list)
+        if debug:
+            print debugStr, "find_adl_identifiers(): Searching with " + Fore.GREEN + str(len(identifiers_list)) + Style.RESET_ALL + " identifiers defined.."
+            print debugStr, "find_adl_identifiers(): alID: " + str(alId) 
+            print debugStr, "find_adl_identifiers(): alertID: " + str(alertId)
+            print debugStr, "find_adl_identifiers(): Preparing grep command... "
+    
+    if searchpattern == 0:
+        if debug:
+            print  debugStr, "find_adl_identifiers(): Error: searchpattern is empty!"
+    
+    #Generate grep command
+    if alId and alertId:
+        if alId == alertId:
+            inputId = alertId
+            grepCmd = make_grepCmd(inputId, log, host, dc, searchpattern, context)             
+        else:
+            inputId = alId
+            grepCmd = make_grepCmd(inputId, log, host, dc, searchpattern, context, alertId) 
+    elif alId == None:
+        inputId = alertId
+        grepCmd = make_grepCmd(inputId, log, host, dc, searchpattern, context) 
+    elif alertId == None:
+        inputId = alId
+        grepCmd = make_grepCmd(inputId, log, host, dc, searchpattern, context) 
+    else:
+        if debug:
+            print  warnStr, "Error: Neither alId or alertId could be used to search for identifiers, since they were empty. "
+
+    if debug:
+        print debugStr, "find_adl_identifiers(): Executing identifier search"
+
+    with Spinner(beep=False, message="searching ADL logs...."):
+        lines = run_proc(grepCmd, 'readlines')
+        condensed_lines = condense_lines(lines)
+        if condensed_lines != None:
+            for line in condensed_lines:
+                raw_lines.append(line)
+
+    if raw_lines > 0:
+        ############################# FIND IDENTIFIERS - Build a list of identifiers #################################
+        # Iterate through secondary_identifiers_regex_list and search all matching lines from first pass in 'raw_lines'
+        # to determine account identifiers for use later. 
+        #
+        # Input:  raw_lines
+        # Output: account_identifiers_list, raw_lines
+
+        if debug:
+            print debugStr, "find_adl_identifiers(): Find Identifiers - Finding account identifiers..."
+
+        account_identifiers_list = []
+        #Iterate through GLOBAL list of regexes for second pass
+        with Spinner(beep=False, message="finding unique identifiers...."):
+            for regex in identifier_regexes:
+                if debug:
+                    print debugStr, "find_adl_identifiers(): Processing matches for (regex format) " + regex
+                l = search_list_by_single_regex_pattern(regex, 2, raw_lines)
+                for i in l:
+                    if len(strip(i)) > 5:
+                        account_identifiers_list.append(i)
+
+        #Dedupe identifiers
+        unique_identifiers_list=dedupe_list(account_identifiers_list)
+        for i in unique_identifiers_list:
+                if debug:
+                    print debugStr, "find_adl_identifiers(): Unique Identifier Found (regex format) " + i
+        if len(unique_identifiers_list) > 0:
+            if debug:
+                print debugStr, "find_adl_identifiers(): Find Identifiers - Input Line Count: " + Fore.YELLOW + str(len(raw_lines))
+                print debugStr, "find_adl_identifiers(): Find Identifiers - Identifiers to search: " + Fore.YELLOW + str(len(identifier_regexes))
+                print debugStr, "find_adl_identifiers(): Find Identifiers - Matching Identifiers found: " + Fore.YELLOW + str(len(account_identifiers_list))
+                print debugStr, "find_adl_identifiers(): Find Identifiers - Matching Identifiers found (unique): " + Fore.GREEN + str(len(unique_identifiers_list))
+            
+            if context > 0:
+                #Iterate through condensed third pass lines, and pick out lines that match
+                with Spinner(beep=False, message="cleaning up matches...."):
+                    #Add header
+                    #content.append(write_log_header('adl'))
+                    #Iterate throught condensded lines
+                    for line in raw_lines:
+                        #print line
+                        #print "--------> "
+                        #Iterate through search terms
+                        for regex in identifiers_list:
+                            if regex in line:
+                                #print line
+                                #print "----END----"
+                                if debug:
+                                    pass
+                                    #print debugStr, "find_adl_identifiers(): Line matches identifier: " + regex
+                                content.append(line.strip())
+            else: 
+                if debug:
+                    print debugStr, "find_adl_identifiers(): Returning raw lines since no context was specified " + regex
+                for line in raw_lines:
+                    content.append(line)
+            #Only return if the variables are populated
+            if len(content) > 0 and len(unique_identifiers_list) > 0:
+                if debug:
+                    print debugStr, "find_adl_identifiers(): Success! Returning: " + Fore.GREEN +  str(len(unique_identifiers_list)) + Style.RESET_ALL + " identifiers and " + Fore.GREEN + str(len(content)) + Style.RESET_ALL + " log lines"  
+                #for line in content:
+                    #print 'CONTENTLINE----'
+                    #print line
+                return (unique_identifiers_list, content)
+            else:
+                if debug:
+                    print debugStr, "find_adl_identifiers(): Error! Variable is empty: " + Fore.RED +  str(len(unique_identifiers_list)) + Style.RESET_ALL + " identifiers and " + Fore.RED + str(len(content)) + Style.RESET_ALL + " log lines"
+                return [], []
+        else:
+            if debug:
+                print warnStr, "find_adl_identifiers(): Find Identifiers - " + Fore.RED + "No Matching Identifiers found..."
+            return [], []
+    else:
+        print warnStr, "find_adl_identifiers(): No lines returned from grep.. no identifiers returned either."
+        return [], []
+
+def getAlias(d):
+    """
+    This method returns an array containing
+    a list of aliases for the given domain
+    """
+    try:
+        data = socket.gethostbyname_ex(d)
+        alias = repr(data[0])
+        #print repr(data)
+        return alias
+    except Exception:
+        # fail gracefully
+        return False
+###############################################################
+#
+#                   PROCESS SERVICE LOG FUNCTIONS
+#
+###############################################################
+
+def process_adl(alId, alertId, host, logs, dc, appName, print_to_console):
+    #Name thread
+    name = multiprocessing.current_process().name
+    debugStr = Fore.YELLOW + '*** DEBUG:-\t ' + Style.RESET_ALL + '[' + Fore.GREEN + name + Style.RESET_ALL + ']' + Style.RESET_ALL
+    #This is the function called from the root level to kick off the AL ID log search
+    if len(appName) > 1:
+        pass
+    else:
+        print  warnStr, "process_adl(): Missing or empty function argument"
+    
+    combined_identifiers_list = []
+    thread_identifiers_list = []
+    combined_thread_identifiers_list = []
+    for log in logs:
+        #Container for alerts
+        alIds = []
+        alertIds = []
+        #Container for logs which are being written to a file
+        content = []
+    
+        ############################# FIRST PASS GREP - Find the alId or alertId of the inputId #################################
+        # Finds key identifiers listed in secondary_identifiers_regex_list
+        # input: alId and alertId
+        # regexs: primary_identifiers_regex_list
+        # search pattern: none (alId or alertId or both will be used)
+        # context: 0 lines of grep context
+        # output: raw_lines
+        # output: unique_identifiers
+
+        context = 0
+        filter_regexes = primary_identifiers_regex_list
+
+        (primary_unique_identifiers, raw_lines)=find_adl_identifiers(alId, alertId, host, log, dc, context, filter_regexes)
+        
+        if len(raw_lines) == 0 or not primary_unique_identifiers or len(primary_unique_identifiers) == 0:
+            if debug:
+                print warnStr, "process_adl(): Find Identifiers" + Fore.CYAN + " - Pass #1 - " + Fore.RED + "No Matching Identifiers found, skipping to next pass..."
+            continue
+        else:
+            #Save identifiers
+            with Spinner(beep=False, message="saving unique identifiers...."):            
+                for identifier in primary_unique_identifiers:
+                    if identifier not in combined_identifiers_list:
+                        combined_identifiers_list.append(identifier)
+            
+            #Save thread IDs
+            with Spinner(beep=False, message="saving thread IDs...."):
+                thread_unique_identifiers=filter_lines_by_regexes_return_identifiers(thread_identifiers_regex_list, raw_lines)
+
+            for identifier in thread_unique_identifiers:
+                if identifier not in combined_thread_identifiers_list:
+                    combined_thread_identifiers_list.append(identifier)
+ 
+            #Save raw lines
+            #for line in raw_lines:
+            #    content.append(line)
+            if debug:
+                print debugStr, "process_adl(): Find Identifiers" + Fore.CYAN + " - Pass #1 - " + Fore.MAGENTA + "Raw lines returned: " + Fore.YELLOW + str(len(raw_lines))
+                print debugStr, "process_adl(): Find Identifiers" + Fore.CYAN + " - Pass #1 - " + Fore.MAGENTA + "Total identifiers collected (this pass): " + Fore.YELLOW + str(len(primary_unique_identifiers))
+                print debugStr, "process_adl(): Find Identifiers" + Fore.CYAN + " - Pass #1 - " + Fore.MAGENTA + "Total identifiers collected (all passes): " + Fore.YELLOW + str(len(combined_identifiers_list))
+                print debugStr, "process_adl(): Find Thread IDs " + Fore.CYAN + " - Pass #1 - " + Fore.MAGENTA + "Total thread IDs collected (this pass): " + Fore.YELLOW + str(len(thread_unique_identifiers))
+                print debugStr, "process_adl(): Find Thread IDs " + Fore.CYAN + " - Pass #1 - " + Fore.MAGENTA + "Total thread IDs collected (all passes): " + Fore.YELLOW + str(len(combined_thread_identifiers_list))
+
+         ############################# SECOND PASS GREP - Find the alId or alertId of the inputId #################################
+        # Finds key identifiers listed in secondary_identifiers_regex_list
+        # input: unique_identifiers (from first pass)
+        # regexs: secondary_identifiers_regex_list
+        # search pattern: unique_identifiers_list
+        # context: 0 lines of grep context
+        # output: raw_lines
+        # output: unique_identifiers
+
+        context = 0
+        filter_regexes = secondary_identifiers_regex_list
+
+        (unique_identifiers, raw_lines)=find_adl_identifiers(alId, alertId, host, log, dc, context, filter_regexes, combined_identifiers_list)
+        
+        if len(raw_lines) == 0 or not unique_identifiers or len(unique_identifiers) == 0:
+            if debug:
+                print warnStr, "process_adl(): Find Identifiers" + Fore.CYAN + " - Pass #2 -" + Fore.RED + "No Matching Identifiers found, skipping to next pass..."
+            continue
+        else:
+            #Save identifiers
+            with Spinner(beep=False, message="saving unique identifiers...."):            
+                for identifier in unique_identifiers:
+                    if identifier not in combined_identifiers_list:
+                        combined_identifiers_list.append(identifier)
+            
+            #Save thread IDs
+            with Spinner(beep=False, message="saving thread IDs...."):            
+                thread_unique_identifiers=filter_lines_by_regexes_return_identifiers(thread_identifiers_regex_list, raw_lines)
+            #Only add new ones
+            for identifier in thread_unique_identifiers:
+                if identifier not in combined_thread_identifiers_list:
+                    combined_thread_identifiers_list.append(identifier)
+            
+            #Save raw lines
+            #for line in raw_lines:
+            #    content.append(line)
+            if debug:
+                print debugStr, "process_adl(): Find Identifiers" + Fore.CYAN + " - Pass #2 - " + Fore.MAGENTA + "Raw lines returned: " + Fore.YELLOW + str(len(raw_lines))
+                print debugStr, "process_adl(): Find Identifiers" + Fore.CYAN + " - Pass #2 - " + Fore.MAGENTA + "Total identifiers collected (this pass): " + Fore.YELLOW + str(len(unique_identifiers))
+                print debugStr, "process_adl(): Find Identifiers" + Fore.CYAN + " - Pass #2 - " + Fore.MAGENTA + "Total identifiers collected (all passes): " + Fore.YELLOW + str(len(combined_identifiers_list))
+                print debugStr, "process_adl(): Find Thread IDs " + Fore.CYAN + " - Pass #2 - " + Fore.MAGENTA + "Total thread IDs collected (this pass): " + Fore.YELLOW + str(len(thread_unique_identifiers))
+                print debugStr, "process_adl(): Find Thread IDs " + Fore.CYAN + " - Pass #2 - " + Fore.MAGENTA + "Total thread IDs collected (all passes): " + Fore.YELLOW + str(len(combined_thread_identifiers_list))
+
+         ############################# THIRD PASS GREP - Search by identifiers found in Second Pass #################################
+        # Finds key identifiers listed in secondary_identifiers_regex_list
+        # input: unique_identifiers (from second pass)
+        # regexs: secondary_identifiers_regex_list
+        # search pattern: unique_identifiers_list
+        # context: 50 lines of grep context (or 300 of --deep is enabled)
+        # output: raw_lines
+        # output: unique_identifiers
+
+        context = thirdPassContext
+        filter_regexes = secondary_identifiers_regex_list
+        
+        (unique_identifiers, raw_lines)=find_adl_identifiers(alId, alertId, host, log, dc, context, filter_regexes, combined_identifiers_list)
+        
+        if len(raw_lines) == 0 or not unique_identifiers or len(unique_identifiers) == 0:
+            if debug:
+                print warnStr, "process_adl(): Find Identifiers" + Fore.CYAN + " - Pass #3 -" + Fore.RED + "No Matching Identifiers found, skipping to next pass..."
+            continue
+        else:
+            #Save identifiers
+            with Spinner(beep=False, message="saving unique identifiers...."):                        
+                for identifier in unique_identifiers:
+                    if identifier not in combined_identifiers_list:
+                        pass
+                        # don't save these identifiers
+                        #combined_identifiers_list.append(identifier)
+            #Save raw lines
+            with Spinner(beep=False, message="applying filters...."):                
+                for line in raw_lines:
+                    for identifier in unique_identifiers:
+                        for thread_id in combined_thread_identifiers_list:
+                            if does_line_match_regex(thread_id, line):
+                                #print "THREAD MATCHED ------------\n" + line
+                                content.append(line)
+                                continue
+                            elif does_line_match_regex(identifier, line):
+                                #print "IDENTIFIER MATCHED ------------\n" + line
+                                content.append(line)
+                                continue
+                            else:
+                                pass
+                                #print "DISCARDING LINE"
+                        #Retain any lines which match the identifiers
+                        if does_line_match_regex(identifier, line):
+                            content.append(line)
+                            continue
+
+            if debug:
+                print debugStr, "process_adl(): Find Identifiers" + Fore.CYAN + " - Pass #3 - " + Fore.MAGENTA + "Raw lines returned: " + Fore.YELLOW + str(len(raw_lines))
+                print debugStr, "process_adl(): Find Identifiers" + Fore.CYAN + " - Pass #3 - " + Fore.MAGENTA + "Total identifiers collected (this pass): " + Fore.YELLOW + str(len(unique_identifiers))
+                print debugStr, "process_adl(): Find Identifiers" + Fore.CYAN + " - Pass #3 - " + Fore.MAGENTA + "Total identifiers collected (all passes): " + Fore.YELLOW + str(len(combined_identifiers_list))
+                print debugStr, "process_adl(): Find Thread IDs " + Fore.CYAN + " - Pass #3 - " + Fore.MAGENTA + "Total thread IDs collected (this pass): " + Fore.YELLOW + str(len(thread_unique_identifiers))
+                print debugStr, "process_adl(): Find Thread IDs " + Fore.CYAN + " - Pass #3 - " + Fore.MAGENTA + "Total thread IDs collected (all passes): " + Fore.YELLOW + str(len(combined_thread_identifiers_list))
+                    
+         ############################# FOURTH PASS GREP - Search by identifiers found in Third Pass #################################
+        # Finds key identifiers listed in secondary_identifiers_regex_list
+        # input: unique_identifiers (from second pass)
+        # regexs: secondary_identifiers_regex_list
+        # search pattern: unique_identifiers_list
+        # context: 50 lines of grep context
+        # output: raw_lines
+        # output: unique_identifiers
+
+        # context = 50
+        # filter_regexes = secondary_identifiers_regex_list
+        # unique_identifiers, raw_lines=find_adl_identifiers(alId, alertId, host, log, dc, context, filter_regexes, combined_identifiers_list)
+    
+        # if len(raw_lines) == 0 or not unique_identifiers or len(unique_identifiers) == 0:
+        #     if debug:
+        #         print warnStr, "process_adl(): Find Identifiers" + Fore.CYAN + " - Pass #3 -" + Fore.RED + "No Matching Identifiers found, skipping to next pass..."
+        #     continue
+        # else:
+        #     #Save identifiers
+        #     for identifier in unique_identifiers:
+        #         if identifier not in combined_identifiers_list:
+        #             combined_identifiers_list.append(identifier)
+        #     #Save raw lines
+        #     for line in raw_lines:
+        #         content.append(line)
+        #     if debug:
+        #         print debugStr, "process_adl(): Find Identifiers" + Fore.CYAN + " - Pass #3 - " + Fore.MAGENTA + "Matcing identifiers returned: " + Fore.YELLOW + str(len(unique_identifiers))
+        #         print debugStr, "process_adl(): Find Identifiers" + Fore.CYAN + " - Pass #3 - " + Fore.MAGENTA + "Raw lines returned: " + Fore.YELLOW + str(len(raw_lines))
+        #         print debugStr, "process_adl(): Find Identifiers" + Fore.CYAN + " - Pass #3 - " + Fore.MAGENTA + "Total identifiers collected (this pass): " + Fore.YELLOW + str(len(unique_identifiers))
+        #         print debugStr, "process_adl(): Find Identifiers" + Fore.CYAN + " - Pass #3 - " + Fore.MAGENTA + "Total identifiers collected (all passes): " + Fore.YELLOW + str(len(combined_identifiers_list))
+    
+        ############################ DEDUPE OUTPUT #############################################
+        #
+        # searches all lines and picks out the duplicate
+        #
+        if debug:
+            print debugStr, "process_adl(): Line count before dedupe: " + str(len(content))
+        with Spinner(beep=False, message="deduping lines...."):                
+            uniq_content_list=uniq(content)
+        if debug:
+            print debugStr, "process_adl(): Line count after dedupe: " + str(len(uniq_content_list))
+        with Spinner(beep=False, message="removing truncated lines...."):                
+            truncated_content_removed=remove_truncated_elements_matching_timestamp(uniq_content_list)
+        if debug:
+            print debugStr, "process_adl(): Line count after truncated lines removed: " + str(len(truncated_content_removed))
+        with Spinner(beep=False, message="sorting lines...."):                
+            sorted_content=sorted(truncated_content_removed, key=custom_datetime_sort)
+        if debug:
+            print debugStr, "process_adl(): Line count after sort: " + str(len(sorted_content))
+        #deduped_content_list=dedupe_list_new(sorted_content)
+        #print "LIST COUNT AFTER DEDUPE" + str(len(deduped_content_list))
+        
+        #sorted_content=deduped_content_list.sort(key=lambda x: custom_datetime_sort(x))
+        ############################ ADD HEADER ################################################
+        #
+        # adds a header line to the log or console output
+        #
+        sorted_content.insert(0, write_log_header('adl', log))
+
+        ############################### PROBLEM !!!! ############################################
+        #   what if log matches were found across multiple log files, we only write to one log  #
+        ############################# EXPORT TO FILE OR PRINT ###################################
+
+        #Print to console
+        if not file_output or (debug or console) and adl:
+            #content.append(write_log_header('adl'))
+            #for line in third_pass_raw_lines:
+            #    content.append(line)
+            for line in sorted_content:
+                print(line)
+
+        #Write to file
+        elif (adl and file_output):
+            #content.append(write_log_header('adl'))
+            #for line in third_pass_raw_lines:
+                #content.append(line)
+            write_list_to_file(output_file_names['al'],sorted_content)
+            print(Fore.GREEN + 'FILE GENERATED:\t' + Fore.WHITE + 'Wrote AL Logs to file ' + Style.BRIGHT + output_file_names['al'])
+        else:
+            print warnStr, "File output option not selected. Use --file to write output to a file."
+        
+def process_a7_log(alertId,ccsEnv, service_type):
+    name = multiprocessing.current_process().name
+    debugStr = Fore.YELLOW + '*** DEBUG:-\t ' + Style.RESET_ALL + '[' + Fore.GREEN + name + Style.RESET_ALL + ']' + Style.RESET_ALL
+    #service_type = "email', "sms", "smsinb"" etc
+    if not file_output or console or debug:
+        print(write_log_header(service_type))
+    ##Define a list of dates to search
+    search_dates_list=find_surrounding_dates(alertId,"nextday")
+    ##Define log container
+    content = []
+    ##Check to make sure a processing cluster was identified
+    for date in search_dates_list:
+        if debug:
+            print debugStr, "process_a7_log(): Searching logs on date:" + str(date)
+        ##Determine if logs are on storage based on alert date vs. rolleover date  # storage = 0|1, today=0|1
+        storage, today = are_logs_on_storage(date,ccsEnv, 'a7')
+        ##Build find command to identify log locations (storage or SMS host)
+    
+        #Find appName from alertId
+        idDict = split_id(alertId)
+        appName = idDict['name']
+        #Set log name (decides whether or not to add the date to the filename)    
+        logName = check_log_date(today,date,service_type)
+        # Apply exceptions to appName
+        findName = check_name_exception(appName)
+        ##Execute find command and store results  # hostnames = ['binoche.hosts.adeptra.com', 'dexter.hosts.adeptra.com']
+        if service_type == 'sms':
+            hostnames = get_sms(dc,ccsEnv)
+        elif service_type == 'email':
+            hostnames = get_email(dc,ccsEnv) 
+        elif service_type == 'smsinb':
+            hostnames = get_smsinb(dc,ccsEnv)
+        else:
+            print warnStr, "process_a7_log(): Error, no service type was used" 
+                      
+        ##Iterate through logLocations and Execute SMS Log search
+        for host in hostnames:
+            raw_lines = []
+            combined_thread_identifiers_list = []
+            searchFilter = ""
+            # Find the location of the logs we're searching for (storage or service host)
+            logs, datacenter = identify_log_location(host, logName, storage, service_type)
+            
+            for log in logs:
+                if debug:
+                    print debugStr, "process_a7_log(): Found A7 Log Location: " + log
+                    print debugStr, "process_a7_log(): Performing A7 log search by alertId"
+                #Execute SMS log search and print matching lines # make_a7SearchCmd(x,x,x,x,x,x)
+                context=0
+                cmd = make_a7SearchCmd(host, alertId, log, datacenter, storage, context)
+                with Spinner(beep=False, message="searching A7 " + service_type + " log...."):
+                    lines = run_proc(cmd).stdout.readlines()
+                    condensed_lines = condense_lines(lines)
+                    if condensed_lines != None:
+                        for line in condensed_lines:
+                            raw_lines.append(line)
+                if debug:
+                    print debugStr, "process_a7_log(): Lines Found: " + str(len(raw_lines))
+                
+                if raw_lines > 0:
+                    ############################# FIND THREAD IDs - Build a list of thread identifiers #################################
+                    # Iterate through thread_identifiers_regex_list and search all matching lines from first pass in 'raw_lines'
+                    # to determine thread identifiers for use later. 
+                    #
+                    # Input:  raw_lines
+                    # Output: thread_unique_identifiers, raw_lines
+                    
+                    #Save thread IDs
+                    with Spinner(beep=False, message="saving thread IDs...."):
+                        thread_unique_identifiers=filter_lines_by_regexes_return_identifiers(thread_identifiers_regex_list, raw_lines)
+                    
+                    for identifier in thread_unique_identifiers:
+                        if identifier not in combined_thread_identifiers_list:
+                            combined_thread_identifiers_list.append(identifier)
+                            
+                    if debug:
+                        print debugStr, "process_a7_log(): Find Thread IDs " + Fore.CYAN + " - Pass #1 - " + Fore.MAGENTA + "Total thread IDs collected (this pass): " + Fore.YELLOW + str(len(thread_unique_identifiers))
+                        print str(combined_thread_identifiers_list)
+                    #Execute A7 log search and print matching lines # make_a7SearchCmd(x,x,x,x,x,x)
+                    #Keep context zero so it doesnt pick up extra lines from A7 log (JIRA: ERAS-201)
+                    context=0
+                    if context == 0:
+                        if debug:
+                            print debugStr, "process_a7_log(): Search context is zero, using logs from first pass"
+                        for line in raw_lines:
+                            filtered_line = line.replace('(DEBUG|INFO)\scom.adeptra7\.\w+.\w+\s-',' - ')
+                            content.append(filtered_line)
+                    else:
+                        if debug:
+                            print debugStr, "process_a7_log(): Taking a second pass over log file, searching " + str(context) + " surrounding lines."
+                        raw_lines = []
+                        cmd = make_a7SearchCmd(host, alertId, log, datacenter, storage, context)
+                        with Spinner(beep=False, message="searaching A7 " + service_type + " log...."):
+                            lines = run_proc(cmd).stdout.readlines()
+                            condensed_lines = condense_lines(lines)
+                            if condensed_lines != None:
+                                for line in condensed_lines:
+                                    raw_lines.append(line)
+                        if debug:
+                            print debugStr, "process_a7_log(): Lines Found: " + str(len(raw_lines))
+                
+                        if raw_lines > 0:
+                        
+                            #Save raw lines
+                            with Spinner(beep=False, message="filtering lines...."):                
+                                for line in raw_lines:
+                                        for thread_id in combined_thread_identifiers_list:
+                                            if does_line_match_regex(thread_id, line):
+                                                #print "THREAD MATCHED ------------\n" + line
+                                                filtered_line = line.replace('(DEBUG|INFO)\scom.adeptra7\.\w+.\w+\s-',' - ')
+                                                content.append(filtered_line)
+                                            elif does_line_match_regex(identifier, line):
+                                                #print "IDENTIFIER MATCHED ------------\n" + line
+                                                content.append(line)
+                                            else:
+                                                pass
+                                                #print "DISCARDING LINE"
+                        else:
+                            print debugStr, "process_a7_log(): Error! No lines were returned from grep (Second Pass)!"
+                            continue
+                        
+                else:
+                    print debugStr, "process_a7_log(): Error! No lines were returned from grep (First Pass)!"
+                    continue
+            # If no logs found for the provided input
+            if len(logs) == 0:
+                if not quiet:
+                    print warnStr + ' No A7 logs found'
+                    #print warnStr + 'Find command: ' + findCmd
+
+    #Sort combined lines by datetimestamp
+    if debug and len(content) > 0:
+        print debugStr, "process_a7_log(): Sorting logs by timestamp..."
+    sorted_content=sorted(content, key=custom_datetime_sort)
+    
+    ############################ DEDUPE OUTPUT #############################################
+    #
+    # searches all lines and picks out the duplicate
+    #
+    if debug:
+        print debugStr, "process_a7_log(): Line count before dedupe: " + str(len(content))
+    with Spinner(beep=False, message="deduping matches...."):                
+        uniq_content_list=uniq(content)
+    if debug:
+        print debugStr, "process_a7_log(): Line count after dedupe: " + str(len(uniq_content_list))
+    with Spinner(beep=False, message="removing truncated log lines...."):                
+        truncated_content_removed=remove_truncated_elements_matching_timestamp(uniq_content_list)
+    if debug:
+        print debugStr, "process_a7_log(): Line count after truncated lines removed: " + str(len(truncated_content_removed))
+    with Spinner(beep=False, message="sorting matches...."):                
+        sorted_content=sorted(truncated_content_removed, key=custom_datetime_sort)
+    if debug:
+        print debugStr, "process_a7_log(): Line count after sort: " + str(len(sorted_content))
+        #Old sorting method which could remove lines if they have the same timestamp + microseconds
+        #allLines.sort(key = lambda l : l.split(' [MessageListener')[0]) 
+    if len(sorted_content) > 0:
+        if console or debug:
+            if debug:
+                debugStr, "process_a7_log(): Printing A7 lines found..."
+            #Print the sorted lines
+            for line in sorted_content:
+                print line
+        ##Check if combined lines is empty and print debug line or write file
+        if file_output:
+            content = []
+            if debug:
+                debugStr, "process_a7_log(): Writing " + str(len(sorted_content)) + " lines to A7 file"
+            content.append(write_log_header(service_type))
+            for line in sorted_content:
+                content.append(line)
+            print(Fore.GREEN + 'FILE GENERATED:\t' + Fore.WHITE + 'Wrote A7 Logs to file ' + Style.BRIGHT + output_file_names[service_type])
+            write_list_to_file(output_file_names[service_type],content)
+        else:
+            if debug:
+                debugStr, "process_a7_log(): File output or print to console wasn't selected..."
+            print(Fore.YELLOW + service_type.upper() + " LOGGING: " + Style.BRIGHT + Fore.GREEN + str(len(content)) + Style.RESET_ALL + " lines found in search. Use the --console or --file options to see the results")
+    else:
+        if debug:
+            print warnStr, 'process_a7_log(): A7 (' + service_type.upper() + ') search failed to find any matching logs'
+        if console and not file_output:
+            print Fore.RED + "No log matches found."
+    
+    
+def process_ae(alertId,ccsEnv):
+    name = multiprocessing.current_process().name
+    debugStr = Fore.YELLOW + '*** DEBUG:-\t ' + Style.RESET_ALL + '[' + Fore.GREEN + name + Style.RESET_ALL + ']' + Style.RESET_ALL
+    
+    if not file_output or console or debug:
+        print(write_log_header('ae'))
+    ##Define a list of dates to search
+    search_dates_list=find_surrounding_dates(alertId,"nextday")
+    ##Using alert2proccluster <alertid> script identify datacenter and hosts # hostName = xxxxx
+    try:
+        (processingCluster,dwhSlave) = which_processing_cluster(alertId, ccsEnv)
+    except:
+        processingCluster = None
+        dwhSlave = None
+    #Define log container
+    allLines = []
+    ##Check to make sure a processing cluster was identified
+    if processingCluster and len(processingCluster) > 1:
+        if debug:
+            print debugStr, "process_ae(): Processing cluster found: " + Fore.GREEN + processingCluster + Style.RESET_ALL + " using lookup from " + Fore.YELLOW + dwhSlave
+            print debugStr, "process_ae(): Identified the following days which may contain log data" + str(search_dates_list)
+        content = []
+        for date in search_dates_list:
+            if debug:
+                print debugStr, "process_ae(): Searching logs on date:" + str(date)
+            ##Determine if logs are on storage based on alert date vs. rolleover date  # storage = 0|1, today=0|1
+            storage, today = are_logs_on_storage(date,ccsEnv,'ae')
+            ##Build find command to identify log locations (storage or AE host)
+            
+            #Find appName from alertId
+            idDict = split_id(alertId)
+            appName = idDict['name']
+            
+            #Set log name (decides whether or not to add the date to the filename)    
+            logName = check_log_date(today,date,'ae')
+            # Apply exceptions to appName
+            findName = check_name_exception(appName)
+            ##Execute find command and store results  # hostnames = ['binoche.hosts.adeptra.com', 'dexter.hosts.adeptra.com']
+            aeHostnames = get_ae(processingCluster,ccsEnv)
+            ##Iterate through logLocations and Execute AE Log search
+            for host in aeHostnames:
+                searchFilter = ""
+                # Find the location of the logs we're searching for (storage or service host)
+                logs, datacenter = identify_log_location(host, logName, storage, 'ae')
+                for log in logs:
+                    if debug:
+                        print debugStr, "process_ae(): Found Log Location: " + log
+                        print debugStr, "process_ae(): Performing search by alertId"
+                    #Execute AE log search and print matching lines # make_a7SearchCmd(x,x,x,x,x,x)
+                    context = 0
+                    cmd = make_a7SearchCmd(host, alertId, log, datacenter, storage, context)
+                    with Spinner(beep=False, message="analyzing alertExecutor logs...."):
+                        lines = run_proc(cmd).stdout.readlines()
+                    if debug:
+                        print debugStr, "process_ae(): Lines Found: " + str(len(lines))
+                    #Inspect lines and extract the thread ID, grep extracted 5 lines of context
+                    messageListeners = []
+                    if debug and len(lines) > 0:
+                        print debugStr, "process_ae(): Running initial pass over logs to extract thread Ids..."
+                    for line in lines:
+                        #Find the messageListener thread ID
+                        if alertId in line:
+                            try:
+                                listener = re.search('(\[MessageListener-[0-9]{1,4}\]).*executableAlertReceived', line).groups(1)
+                                if listener not in messageListeners:
+                                    messageListeners.append(listener)
+                            except:
+                                continue
+                    #Take a second pass and condense the lines removing any breaks where line doesnt start with a datetime
+                    condensed_lines=normalize_grep_response(lines,'ae')
+                                        
+                    #Take a pass over the condensed logs and pull out the lines matching the searchFilter and alertId 
+                    if debug and len(condensed_lines) > 1:
+                        print debugStr, "process_ae(): Taking a second pass over condensed logs...."
+                    for line in condensed_lines:
+                        if any(listener in messageListeners for word in line) and alertId in line:
+                                    filtered_line = line.replace(' - ' + alertId + ':',' - ')
+                                    #if debug:
+                                        #print debugStr, "Adding line to final container..."
+                                    allLines.append(filtered_line)
+                            #print line
+                # If no logs found for the provided input
+                if len(logs) == 0:
+                    if not quiet:
+                        print warnStr + 'No AE logs found'
+                        print warnStr + 'Find command: ' + findCmd
+
+        #Sort combined lines by datetimestamp
+        if debug and len(allLines) > 0:
+            print debugStr, "process_ae(): Sorting logs by timestamp...."
+        allLines.sort(key = lambda l : l.split(' [MessageListener')[0]) 
+        
+        if len(allLines) > 0:
+            if not file_output or console or debug:
+                if debug:
+                    debugStr, "process_ae(): Printing AE lines found...."
+                #Print the sorted lines
+                for line in allLines:
+                    print line
+            ##Check if combined lines is empty and print debug line or write file
+            elif file_output:
+                content = []
+                if debug:
+                    debugStr, "process_ae(): Writing " + str(len(allLines)) + " lines to AE file"
+                content.append(write_log_header('ae'))
+                for line in allLines:
+                    content.append(line)
+                print(Fore.GREEN + 'FILE GENERATED:\t' + Fore.WHITE + 'Wrote AE Logs to file ' + Style.BRIGHT + output_file_names['ae'])
+                write_list_to_file(output_file_names['ae'],content)
+            else:
+                if debug:
+                    debugStr, "File output or print to console wasn't selected..."
+                print(Fore.YELLOW + "ALERT EXECUTOR: " + Style.BRIGHT + Fore.GREEN + str(len(allLines)) + Style.RESET_ALL + " lines found in search. Use the --console or --file options to see the results")
+        else:
+            if debug:
+                print debugStr, 'AE search command failed to find any output'
+    
+##########################
+#multiprocessing functions
+##########################
+def q_reader(queue):
+    msg = []
+    ## Read from the queue; this will be spawned as a separate Process
+    while True:
+        try:
+            message = queue.get(True, 180)
+            msg.append(message)         # Read from the queue and do nothing
+            #print debugStr, "Got Message: + " + str(message)
+            if (message == 'DONE'):
+                break
+        except Exception as error:
+            if debug:
+                print debugStr, "q_reader(): Queue is now empty..." + str(error) 
+            break
+        #print debugStr, "Reading from queue..."
+    #print debugStr, "q_reader(): Returning " + str(len(msg)) + " lines"
+    return msg
+
+def q_writer(queue, message):
+    ## Write to the queue
+    queue.put(message)
+
+def info(title):
+    print title
+    print debugStr, 'module name:', __name__
+    if hasattr(os, 'getppid'):  # only available on Unix
+        print debugStr,'parent process:', os.getppid()
+    print debugStr,'process id:', os.getpid()
+    
+###############################################
+#          CCS VOICE FUNCTIONS
+###############################################            
+def process_voice(alertId,environment, region, function):
+    name = multiprocessing.current_process().name
+    debugStr = Fore.YELLOW + '*** DEBUG:-\t ' + Style.RESET_ALL + '[' + Fore.GREEN + name + Style.RESET_ALL + ']' + Style.RESET_ALL
+    
+    if function == 'logs-voiceapp':
+        log_function = "Voiceapp"
+    elif function == 'logs-freeswitch':
+        log_function = "Freeswitch"
+    elif function == 'logs-voice-controller':
+        log_function = "Voice Controller"
+    elif function == 'logs-vii-agent':
+        log_function = "Vii-Agent"
+    elif function == 'call-stats':
+        log_function = "Call Stats"
+    else:
+        if debug:
+            print warnStr, "Error: No voice log function was defined"
+
+    #if console or debug:
+        #print(write_log_header('voice', log_function))
+    
+    output = []
+    short_region = region[:2]
+    datacenters = ccs_voice_region_mapping[short_region]
+    message = "collecting " + log_function + " logs...."
+    with Spinner(beep=False, message=message):  
+        #Needed to return data from the jobs using a shared variable (return_dict)
+        manager = multiprocessing.Manager()
+        queue = manager.Queue()
+        jobs = []
+        for datacenter in datacenters:
+            p = multiprocessing.Process(target=get_voice, args=(alertId, function, environment, datacenter, queue))
+            p.daemon = True
+            jobs.append(p)
+            if debug: 
+                print debugStr, "Starting subprocess..."
+            p.start()
+        
+                    
+        for process in jobs:
+            process.join(1200)
+            
+        queue.put('DONE')
+        
+        q_output=q_reader(queue)
+        if debug: 
+            print debugStr, "process_voice(): Queue output contains " + Fore.YELLOW + str(len(q_output)) + Style.RESET_ALL + " lines"
+
+        for process in jobs:
+            if debug:
+                print debugStr, "process_voice(): Terminating subprocess..."
+            process.terminate()
+
+            
+        for line in q_output:
+            if debug: 
+                print debugStr, "process_voice(): Appending " + Fore.GREEN + str(len(q_output)) + Style.RESET_ALL + " lines from subprocess"
+            output.append(line)
+            
+    if output != None and len(output) > 0:
+        if debug:
+            print debugStr, "Voice Logs - Function: " + function + ' found ' + Fore.GREEN + str(len(output)) + Style.RESET_ALL + ' lines'
+    else:
+        if debug:
+            print debugStr, "Voice Logs - Function: " + function + ' found ' + Fore.RED + '0' + Style.RESET_ALL + ' lines'
+    
+    if output != None and len(output) > 0:
+        if not file_output or debug:
+            print(write_log_header('voice', log_function))
+            for line in output:
+                #for line in block:
+                print line.rstrip()
+        if file_output:
+            content = []
+            content.append(write_log_header('voice', log_function))
+            for block in output:
+                #for line in block:
+                content.append(block.rstrip())
+            write_list_to_file(output_file_names[function],content)
+            print(Fore.GREEN + 'FILE GENERATED:\t' + Fore.WHITE + 'Wrote ' + log_function + ' to file ' + Style.BRIGHT + output_file_names[function])
+    else:
+        if debug:
+            print debugStr, log_function + 'search command failed to find any output'
+
+# Checks for apm host, checks access, then looks through logs
+def process_apm(alertId,ccsEnv):
+    name = multiprocessing.current_process().name
+    debugStr = Fore.YELLOW + '*** DEBUG:-\t ' + Style.RESET_ALL + '[' + Fore.GREEN + name + Style.RESET_ALL + ']' + Style.RESET_ALL
+    
+    #modes:
+    # 0 apm logs on APM Host
+    # 1 apm logs on storage host
+    apmLines = []
+    rulesHit = []
+    apmName = appName.lower()
+    
+    idDict = split_id(alertId)
+    logDate = idDict['year'] + '-' + idDict['month'] + '-' + idDict['day']
+    
+    (logsOnStorage, today)=are_logs_on_storage(logDate,ccsEnv, 'apm')
+    
+    if not file_output or console or debug:
+        print(write_log_header('apmlog'))
+    print
+    if not logsOnStorage:
+        #apmHostName = apmName + '-apm-' + ccsEnv + '.' + ccsGlobal
+        apmHostName = host_moved(apmName + '-apm-' + ccsEnv + '.' + ccsGlobal, logDate)
+        apmLogDir = '/opt/wf/log/'
+        
+        # Determine if APM host cname exists:
+        try:
+            socket.gethostbyname(apmHostName)
+        except:
+            exit('Could not find hostname: ' + apmHostName)
+        if not quiet:
+            print 'APM HOST:\t' + apmHostName + ' -> ' + socket.getfqdn(apmHostName)
+        
+        # Check we can reach host over ssh
+        
+        if check_host_port(apmHostName, 22) != 0:
+            print warnStr + 'Cannot connect to apm over ssh: ' \
+                + apmHostName
+            print warnStr + 'Are you running this from a bastion host?'
+            return
+    elif logsOnStorage:
+         apmLogDir = '/mnt/archive/archiver/A7APM/*/opt/wf/log/'
+         apmHostName = 'storage.' + ccsGlobal
+    
+    if today:
+        apmLogName = 'apm2' + apmName + '.log'
+    elif logsOnStorage:
+        apmLogName = 'apm2' + apmName + '.log.' + logDate + "*"
+    else:
+        apmLogName = 'apm2' + apmName + '.log.' + logDate
+    apmLog = apmLogDir + apmLogName
+    if debug:
+        print debugStr, 'APM LOG:\t', apmLog
+        if logsOnStorage:
+            k = "True"
+        else:
+            k = "False"
+        print debugStr, "Are logs on storage?:\t", k 
+
+    if not logsOnStorage :
+        if today:
+            apmCmd = 'ssh ' + apmHostName + ' "zgrep .*apm-.*' \
+                + alertId + ' ' + apmLog + '"'
+        else:
+            apmCmd = 'ssh ' + apmHostName + ' "zgrep .*apm-.*' \
+                + alertId + ' ' + apmLog + '*"'
+    elif logsOnStorage:
+        apmCmd = 'ssh ' + 'storage.' + dc + ' "zgrep .*apm-.*' \
+            + alertId + ' ' + apmLog + '*"'
+    
+    #First pass at APM log to extract data
+    if apmCaseRef or apm or ce or apmRules or apmRulesVerbose:
+        if debug:
+            print debugStr , 'apmCmd: ' + apmCmd
+        #Extract raw APM logs
+        if apm or ce or apmRules or apmRulesVerbose:
+            with Spinner(beep=False, message="collecting APM logs...."):
+                apmLines = run_proc(apmCmd).stdout.readlines()
+        else:
+            if debug:
+                print debugStr, 'apm ID not found, --apm flag wasnt set' + apmLogName
+        if len(apmLines) < 1:
+            print 'No matches for alertId in APM Log:\t' + apmLogName
+            return
+        #Extract APM ID
+        for line in apmLines:
+            m = re.search("(?P<apmId>apm-\w+-\d+-\d+).*", line)
+            try:
+                apmId = m.group('apmId')
+                print "APM CaseRef:\t" + apmId
+                break
+            except:
+                if debug:
+                    print warnStr, 'apmId coudlnt be extracted or wasnt found!'
+                pass
+
+
+        if not quiet and apmCaseRef or apmRules or apmRulesVerbose:
+            #Second Pass at APM to collect raw logs:
+            if not logsOnStorage:
+                if today:
+                    apmCmd = 'ssh ' + apmHostName + ' "zgrep -E ' + "'(" + apmId + "|" + alertId + ")' " + apmLog + '"'
+                else:
+                    apmCmd = 'ssh ' + apmHostName + ' "zgrep -E ' + "'(" + apmId + "|" + alertId + ")' " + apmLog + '"'
+            elif logsOnStorage:
+                apmCmd = 'ssh ' + 'storage.' + dc + ' "zgrep -E ' + "'(" + apmId + "|" + alertId + ")' " + apmLog + '"'
+                
+            if debug:
+                print debugStr , 'apmCmd: ' + apmCmd
+            #Extract raw APM logs
+            if apm or apmRules or apmRulesVerbose: 
+                with Spinner(beep=False, message="searching APM logs...."):
+                    apmLines = run_proc(apmCmd).stdout.readlines()
+            
+                if debug:
+                    print debugStr, "APM Log returned " + Fore.GREEN + str(len(apmLines)) + " lines."
+                    print(Style.DIM + 'APM LOG:\t' + apmLog + '\n' + Style.RESET_ALL + Fore.YELLOW + 'APM ID:\t\t' + Style.BRIGHT + apmId)
+        else:
+            print "APM CaseRef:\t" + apmId
+        
+        if len(apmLines) > 0:
+            if not file_output or console or debug and apm:
+                for line in apmLines:
+                    print line.strip()
+            elif file_output and apm:
+                content = []
+                content.append(write_log_header('apmraw'))
+                for line in apmLines:
+                    content.append(line.strip())
+            
+                write_list_to_file(output_file_names['apmraw'],content)
+                print(Fore.GREEN + 'FILE GENERATED:\t' + Fore.WHITE + 'Wrote APM Logs to file ' + Style.BRIGHT + output_file_names['apmraw'])
+    
+        if ce:
+            #Execute apmCaseExplorer
+            
+            if not logsOnStorage:
+                apmHostName = apmName + '-apm-' + ccsEnv + '.' + ccsGlobal
+                apmLogDir = '/opt/wf/log/'
+                
+                # Determine if APM host cname exists:
+                try:
+                    socket.gethostbyname(apmHostName)
+                except:
+                    exit('Could not find hostname: ' + apmHostName)
+                if not quiet:
+                    pass
+                    #print '\nAPM HOST:\t' + apmHostName + ' -> ' + getfqdn(apmHostName.strip().rstrip('.'))
+        
+                # Check we can reach host over ssh
+        
+                if check_host_port(apmHostName, 22) != 0:
+                    print warnStr + 'Cannot connect to apm over ssh: ' \
+                        + apmHostName
+                    print warnStr + 'Are you running this from a bastion host?'
+                    return
+            elif logsOnStorage:
+                 apmHostName = socket.getfqdn(str(apmName + '-apm-' + ccsEnv + '.' + ccsGlobal).strip().rstrip('.')).rstrip('.hosts.adeptra.com')
+                 apmLogDir = '/mnt/archive/archiver/A7APM/'+ apmHostName + '/opt/wf/log/'
+                 apmLog = apmLogDir + apmLogName
+                 
+            with Spinner(beep=False, message="waiting for apmCaseExplorer...."):
+                cmd = make_caseExplorerCmd(apmHostName, apmId, apmLog)
+                ceLines = run_proc(cmd).stdout.readlines()
+            
+            if len(ceLines) > 0:
+                if not file_output or console or debug:
+                    print(write_log_header('ce'))
+                    for line in ceLines:
+                        print line.strip()
+                elif file_output:
+                    content = []
+                    content.append(write_log_header('ce'))
+                    for line in ceLines:
+                        content.append(line.strip())
+                    print(Fore.GREEN + 'FILE GENERATED:\t' + Fore.WHITE + 'Wrote apmCaseExplorer output to file ' + Style.BRIGHT + output_file_names['apmcaseexplorer'])
+                    write_list_to_file(output_file_names['apmcaseexplorer'],content)
+            else:
+                print warnStr, 'process_apm(): apmCaseExplorer command failed to find output for command: ' + cmd
+
+        
+        if apmRules or apmRulesVerbose:
+            if len(apmLines) == 0:
+            #Second Pass at APM to collect raw logs:
+                if debug:
+                    print debugStr, "process_apm(): [Second Pass to collect raw logs + convert into Rule detail]"
+                if not logsOnStorage:
+                    if today:
+                        apmCmd = 'ssh ' + apmHostName + ' "zgrep -E ' + "'(" + apmId + "|" + alertId + ")' " + apmLog + '"'
+                    else:
+                        apmCmd = 'ssh ' + apmHostName + ' "zgrep -E ' + "'(" + apmId + "|" + alertId + ")' " + apmLog + '*"'
+                elif logsOnStorage:
+                    apmCmd = 'ssh ' + 'storage.' + dc + ' "zgrep -E ' + "'(" + apmId + "|" + alertId + ")' " + apmLog + '*"'
+                
+                if debug:
+                    print debugStr , 'apmCmd: ' + apmCmd
+                #Extract raw APM logs
+                if apm or apmRulesVerbose or apmRules:
+                    with Spinner(beep=False, message="collecting APM logs...."):
+                        apmLines = run_proc(apmCmd).stdout.readlines()
+
+            if apmRulesVerbose:
+                expanded_search = 1
+            else:
+                expanded_search = 0
+            rulesLines=get_apm_rules(apmLines, expanded_search)
+            #if (verbose or debug) and not file_output:
+            #    print(write_log_header('apm'))
+            #    for line in rulesLines:
+            #        print line
+
+            if file_output:
+                if expanded_search:
+                    content = []
+                    content.append(write_log_header('apmRulesVerbose'))
+                    for line in rulesLines:
+                        content.append(line.strip())
+                    print(Fore.GREEN + 'FILE GENERATED:\t' + Fore.WHITE + 'Wrote Verbose APM Rules to file ' + Style.BRIGHT + output_file_names['apmrules'])
+                    write_list_to_file(output_file_names['apmrules'],content)
+                else:
+                    content = []
+                    content.append(write_log_header('apm'))
+                    for line in rulesLines:
+                        content.append(line.strip())
+                    print(Fore.GREEN + 'FILE GENERATED:\t' + Fore.WHITE + 'Wrote APM Rules to file ' + Fore.BLUE + output_file_names['apmrules'])
+                    write_list_to_file(output_file_names['apmrules'],content)
+            else:
+                print warnStr, "File output not selected, printing to console"
+                print(write_log_header('apm'))
+                for line in rulesLines:
+                     print line.strip()
+
+
+    else:
+        if debug:
+            print warnStr, "process_apm(): The option to lookup an APM CaseRef wasn't selected"
+    
+    return
+
+# Retrieves and formats xml payload
+def get_payload(alId, logfile, storage):
+    name = multiprocessing.current_process().name
+    debugStr = Fore.YELLOW + '*** DEBUG:-\t ' + Style.RESET_ALL + '[' + Fore.GREEN + name + Style.RESET_ALL + ']' + Style.RESET_ALL
+    
+    if storage:
+        payloadCmd = 'ssh ' + 'storage.' + dc + ' " ' + ''' 'zgrep 'posting.request.*' ''' + alId + "' " + logfile + '"'
+    else:
+        payloadCmd = 'ssh ' + alHost + ' "zgrep \'posting.request.*\'' + alId + ' ' + logfile + '"'
+ 
+    if debug:
+        print debugStr , 'get_payload(): Extract payloadCmd ' + payloadCmd
+    with Spinner(beep=False, message="extracting ADL payload...."):
+        payloadRaw = run_proc(payloadCmd).stdout.readline()
+        try:
+            findChar = payloadRaw.index('<?xml')
+            payload = payloadRaw[findChar:]
+        except:
+            print warnStr, "get_payload(): Payload could not be extracted."
+            payload = ""
+        
+    if len(payload) > 0:
+        if debug or verbose:
+            print(write_log_header('payload'))
+            print payload
+        if payload and file_output:
+            content = []
+            content.append(write_log_header('payload'))
+            content.append(payload)
+            write_list_to_file(output_file_names['payload'],content)
+            print(Fore.GREEN + 'FILE GENERATED:\t' + Fore.WHITE + 'Wrote AL Payload to file ' + Style.BRIGHT + output_file_names['payload'])
+    
+
+
+###############################################################
+#
+#                   UTILITY FUNCTIONS
+#
+###############################################################
+
+def filter_lines_by_regexes_return_identifiers(identifier_regexes, raw_lines):
+    account_identifiers_list = []
+    #Iterate through GLOBAL list of regexes for second pass
+    for regex in identifier_regexes:
+        if debug:
+            print debugStr, "\nfilter_lines_by_regexes_return_identifiers(): Processing matches for (regex format) " + regex
+        l = search_list_by_single_regex_pattern(regex, 2, raw_lines)
+
+        for i in l:
+            if len(strip(i)) > 0:
+                account_identifiers_list.append(i)
+
+    #Dedupe identifiers
+    unique_identifiers_list=dedupe_list(account_identifiers_list)
+    return unique_identifiers_list
+    
+    
+def generate_list_of_line_elements_matching_criteria(regex, line):
+    search_filters = []
+
+    try:
+        k = re.search(regex,line).group('search')
+        for i in k:
+            search_filters.append(i)            
+    except:
+        pass
+    return search_filters
+
+def return_line_matching_criteria(regex, line):
+    try:
+        if re.match(escape(regex),line):
+            value = line            
+        else:
+            value = False
+        return value
+    except:
+        return False
+
+def convert_list_to_grep_filter(deduped_list=[]):
+    #Create a pipe separated list of filters and put into grep-ready format
+    #print str(deduped_list)
+    pipe_sep_patterns = "|".join(deduped_list)
+    grep_ready_filter_string="'(" + escape(pipe_sep_patterns) + ")'"
+    return grep_ready_filter_string
+
+#escapes an unescaped string (123456**+*1234 -> 123456\*\*\*\*\*1234)
+def escape(line):
+    v = line.strip()
+    k = re.sub("\*", "\*", v)
+    i = re.sub("\[", "\[", k)
+    j = re.sub("\]", "\]", i)
+    #k = re.sub(r'\*', r'\*', line)
+    return j
+
+#Unescapes a re.escape escaped string
+def unescape(line):
+    k = re.sub(r'\\(.)', r'\1', line)
+    return k
+
+#Strips whitespace from string
+def strip(line):
+    k = line.strip()
+    return k
+
+def normalize_grep_response(splitLines, filter_type, filters=None):
+    all_the_data = ""
+    #Lines should be split by \n characters
+    for i in range(len(splitLines)):
+    #for line in lines:
+        if filter_type == 'al':            
+            if not re.match('^[0-9][0-9][0-9][0-9].[0-9][0-9].[0-9][0-9] [0-9][0-9]:[0-9][0-9]:[0-9][0-9],[0-9]{1,3}',splitLines[i]):
+                #fixed_lines = [previous_line, current_line]
+                newlines = re.sub("\n", "",splitLines[i]).strip()
+                tabs = re.sub("\t", "", newlines).strip()
+                line = re.sub("\r", "", tabs).strip()
+            else:
+                line = "\n" + splitLines[i].strip()
+        else:
+            if not re.match('^[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9] [0-9][0-9]:[0-9][0-9]:[0-9][0-9],[0-9]{1,3}',splitLines[i]):
+                #fixed_lines = [previous_line, current_line]
+                newlines = re.sub("\n", "",splitLines[i]).strip()
+                tabs = re.sub("\t", "", newlines).strip()
+                line = re.sub("\r", "", tabs).strip()
+            else:
+                line = "\n" + splitLines[i].strip()
+        if str(splitLines[i-1].strip('\n')) == str(splitLines[i].strip('\n')):
+            pass
+        else:
+            all_the_data = "".join([all_the_data, line])
+    
+    splitLines=all_the_data.strip().split("\n")
+    #Build search list
+    normalized = []
+    if debug:
+        print  debugStr, "normalize_grep_response(): 'filters' value" + str(filters)
+    for line in splitLines:
+        if filters:
+            added=0
+            for value in filters:
+                if value in line and added==0:
+                    normalized.append(line)
+                    added=1
+        else:
+            normalized.append(line)    
+    return normalized
+
+def search_list_by_single_regex_pattern(regex, searchtype, lines=[]):
+    #mylist = ["dog", "cat", "wildcat", "thundercat", "cow", "hooo"]
+    #r = re.compile(escaped_regex)
+    #print escaped_regex
+    #outputlist = filter(r.match, lines)
+    outputlist = []
+    #regex_e=escape(regex)
+    for line in lines:
+        #search type - capturegroup_1
+        if searchtype == 1:
+            try:
+                k = re.search(regex,line).groups(1)
+                for i in k:
+                    if debug:
+                        pass
+                        #print debugStr, "search_list_by_single_regex_pattern(): Match Found (Capture group '1'): " + i
+                    outputlist.append(i)
+                else:
+                    #print warnStr, "search_list_by_single_regex_pattern(): Complete failure for " + regex + "  \nLine -----> " + line
+                    continue
+            except:
+                continue
+        #Search type 2 - capturegroup_search
+        elif searchtype == 2:
+            try:
+                #print "SEARCHING: " + str(regex) + "IN LINE" + str(line)
+                k = re.search(regex,line).group('search')
+                if debug:
+                    pass
+                    #print debugStr, "search_list_by_single_regex_pattern(): Match Found (Capture group 'search'): " + k + " ==> " + line
+                outputlist.append(k)              
+            except:
+                continue
+        else:
+            if debug:
+                print warnStr, "search_list_by_single_regex_pattern(): Error: No searchtype selected!"
+
+    return outputlist
+
+def does_line_match_regex(regex, line):
+    if debug:
+        pass
+        #print debugStr, "does_line_match_regex(): Regex: " + regex
+    #print warnStr, "search_list_by_single_regex_pattern(): Complete failure for " + regex + "  -> " + line
+    escaped_asterisk = re.sub("\*", "\*", regex)
+    escaped_l_bracket = re.sub("\[", "\[", escaped_asterisk)
+    escaped_r_bracket = re.sub("\]", "\]", escaped_l_bracket)
+    thread = escaped_r_bracket
+    searchpattern = "(" + thread + ")"
+    try:
+        k = re.search(searchpattern,line)
+        if len(k.string) > 0:
+            if debug:
+                pass
+                #print debugStr, "does_line_match_regex(): Match found for  --> " + i
+            return 1
+        else:
+            return 0
+    except:
+        return 0
+
+
+def condense_lines(lines=[]):
+    output = ""
+
+    #Types of logs
+    al_log=0
+    a7_log=0
+
+    #print(str(lines))
+
+    #Check x number of lines
+    if len(lines) >= 250:
+        lines_to_check = 250
+    elif len(lines) > 0 and len(lines) < 250:
+        lines_to_check = len(lines)
+    else:
+        if debug:
+            print warnStr, "\ncondense_lines(): Error - Empty list provided as input."
+        return
+
+    #Identify which log type this is
+    for line in lines[:lines_to_check]: 
+        if re.match('^[0-9][0-9][0-9][0-9]\.[0-9][0-9]\.[0-9][0-9]\s[0-9][0-9]:[0-9][0-9]:[0-9][0-9],[0-9]{1,3}',line):
+            al_log = 1
+            break
+        elif re.match('^[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]\s[0-9][0-9]:[0-9][0-9]:[0-9][0-9],[0-9]{1,3}',line): 
+            a7_log = 1
+            break
+
+    if not a7_log and not al_log:
+        print warnStr, "condense_lines(): Error - First " + str(lines_to_check) + " line(s) didn't match date regex."
+        return
+
+    for i in range(len(lines)):
+        no_tabs = re.sub("\t", "", lines[i]).strip()
+        no_returns = re.sub("\r", "", no_tabs).strip()
+        no_newlines = re.sub("\n", " ", no_returns).strip()
+        no_extra_spaces = re.sub("\s\s+" , "", no_newlines).strip()
+        output = " ".join([output, no_extra_spaces])
+
+    if al_log:
+        outputList=re.split(r'.(?=[0-9][0-9][0-9][0-9]\.[0-9][0-9]\.[0-9][0-9] [0-9][0-9]:[0-9][0-9]:[0-9][0-9],[0-9]{1,3})', output)
+    elif a7_log:
+        outputList=re.split(r'.(?=[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9] [0-9][0-9]:[0-9][0-9]:[0-9][0-9],[0-9]{1,3})', output)
+    else:
+        print warnStr, "condense_lines(): Error - Couldn't detect log type (adl or a7service)."
+        return
+    if debug:
+        pass
+        #print outputList
+    return outputList
+    
+
+def uniq(input):
+  output = []
+  for x in input:
+    if x not in output:
+      output.append(x)
+  return output
+
+def dedupe_list(mylist=[]):
+    if len(mylist) > 0:
+        #return list(set(mylist))
+        lines_seen = set() # holds lines already seen
+        output = []
+        for line in mylist:
+            if line not in lines_seen: # not a duplicate
+                output.append(line)
+                lines_seen.add(line)
+        return output
+    else:
+        if debug:
+            print debugStr, "dedupe_list(): ERROR: List is empty."
+        return []
+
+def check_file_exists(filename):
+    try:
+        open(filename)   # will be a permission error
+        return True
+    except IOError as e:
+        return False
+
+def write_log_header(logtype, logname=None):
+    header=""
+    if logname == None:
+        logname = ""
+        
+    if logtype == 'ae':
+        header = "ALERT EXECUTOR " + logname.strip()
+    elif logtype == 'apmraw':
+        header = "APM RULE EVALUATION (Raw Log) " + logname.strip()
+    elif logtype == 'ce':
+        header = "APM RULE EVALUATION (CaseExplorer) " + logname.strip()
+    elif logtype == 'apm':
+        header = "APM RULE EVALUATION (Rules only) " + logname.strip()
+    elif logtype == 'apmRulesVerbose':
+        header = "APM RULE EVALUATION (Rules, Conditions, and Actions) " + logname.strip()
+    elif logtype == 'apmlog':
+        header = "APM LOG INFO " + logname.strip()
+    elif logtype == 'adl':
+        header = "ADEPTRALINK (Raw Log): " + logname.strip()
+    elif logtype == 'payload':
+        header = "ADL INSERT PAYLOAD: " + logname.strip()
+    elif logtype == 'voice':
+        header = "VOICE LOGGING: " + logname.strip()
+    elif logtype == 'email':
+        header = "EmailService Logging"
+    elif logtype == 'smsinb':
+        header = "smsInboundService Logging"
+    elif logtype == 'sms':
+        header = "SMSService Logging"
+    elif logtype == 'zip':
+        header = "ZIP PACKAGE"
+    else:
+        header = "INCORRECT logtype DEFINED!"
+        
+    content = "\n-----------------------------------------------------------------------------------------------------------------------------------------------------\n"
+    content += "---------> [ " + header + " ]--\n"
+    content += "------------------------------------------------------------------------------------------------------------------------------------------------------\n"
+    return content
+
+def execute_main_tasks(inputId, environment):
+    #thread container
+    jobs = []
+    if environment:
+        ccsEnv = environment
+    else:
+        ccsEnv = run_proc('adeptra-uname -Y').stdout.read().rstrip().lower()
+    # Split ID into component parts
+
+    idDict = split_id(inputId)
+    logDate = idDict['year'] + '-' + idDict['month'] + '-' + idDict['day']
+
+
+    ## START APM PROCESSING ###
+    appName = idDict['name']
+    ## START ALERTID/AL ID SEARCH  ##
+    global logsOnStorage
+    global today
+    try:
+        (logsOnStorage, today) = are_logs_on_storage(logDate, environment, 'adl')
+    except:
+        (logsOnStorage, today) = are_logs_on_storage(logDate, ccsEnv, 'adl')
+
+    # Find al host
+    global alHost
+    alHost = host_moved(get_al(check_name_exception(appName),environment),logDate)
+    
+    # Find host roke
+    #global hostRole
+    #hostRole = determine_host()
+    
+    global dc
+    # Find the datacenter of adl host
+    try:
+        dc = determine_dc(alHost)
+    except:
+        if debug:
+            print 'Could not identify alHost or Datacenter'
+
+    # Determine the filename for find adeptralink.log vs adeptralink.log.2010-01-01:
+    global findLog
+    findLog = check_log_date(today, logDate, 'adl')
+
+    # Apply known exceptions to appName (BMW, RPL)
+    global findName
+    findName = check_name_exception(appName)
+
+    # Build appropriate find command
+    findCmd = make_findCmd(findName, alHost, logsOnStorage)
+    if debug:
+        print debugStr, "execute_main_tasks(): Find Logs Command: " + findCmd
+    # Execute find command
+    logs = get_logs(findCmd)
+    # If logs weren't found, check storage or check the host depending on the existing value of logsOnStorage
+    if len(logs) == 0:
+        if logsOnStorage == 0:
+            k = 1
+        else:
+            k = 0
+        # Build appropriate find command
+        findCmd = make_findCmd(findName, alHost, k)
+        if debug:
+            print debugStr, "execute_main_tasks(): Find Logs Command (alternate attempt): " + findCmd
+            # Execute find command
+        logs = get_logs(findCmd)
+
+    if len(logs) != 0:
+        #print "ARGUMENTS:" + str(argv)
+        if verbose or debug:
+            displayLogs = 1
+        else:
+            displayLogs = 0
+        #(alIds_found, alertIds_found) = find_alid_alertid(inputId, alHost, logs, dc, appName, displayLogs)
+        try:
+            (alIds_found, alertIds_found) = find_alid_alertid(inputId, alHost, logs, dc, appName, displayLogs)
+            if debug:
+                print debugStr, "execute_main_tasks(): AL Alert found:\t" + Fore.GREEN + str(len(alIds_found))
+                print debugStr, "execute_main_tasks(): Alert Id found:\t" + Fore.GREEN + str(len(alertIds_found))
+        except:
+            if debug:
+                print debugStr, "execute_main_tasks(): Couldn't find alID or alertId in logs!\t" + Fore.RED
+            alIds_found = None
+            alertIds_found = None
+            pass
+        if len(alIds_found) == 0 and len(alertIds_found) == 0:
+            return False
+        if alIds_found != None and alertIds_found != None: 
+            # Perform additional search tasks           
+            count=0
+            for alId, alertId in zip(alIds_found, alertIds_found):
+                if debug:
+                    print debugStr, "execute_main_tasks(): Processing Tasks for AL AlertID: " + alId
+                    print debugStr, "execute_main_tasks(): Processing Tasks for WF AlertID: " + alertId
+                #Process payload search for alId, which matches the index of the alertId currently being processed
+                if payload or adl:
+                    for log in logs:
+                    #try:
+                        if debug:
+                            print debugStr, "execute_main_tasks(): Attempting to fetch ADL payload for: " + alId
+                        if adl:
+                            if debug:
+                                print debugStr, "execute_main_tasks(): Attempting to fetch ADL logs for: " + alId
+                            if file_output:
+                                adl_process = multiprocessing.Process(target=process_adl, args=(alId, alertId, alHost, logs, dc, appName, displayLogs))
+                                jobs.append(adl_process)
+                            else:
+                                process_adl(alId, alertId, alHost, logs, dc, appName, displayLogs)
+                        
+                        if payload:
+                            #print(write_log_header('payload'))
+                            #get_payload(alIds_found[count], log, logsOnStorage)
+                            if file_output:
+                                payload_process = multiprocessing.Process(target=get_payload, args=(alId, log, logsOnStorage))
+                                jobs.append(payload_process)
+                            else:
+                                get_payload(alId, log, logsOnStorage)
+                        
+
+
+                    #except:
+                        #if debug:
+                            #print debugStr, "Search for payload for " + str(alIds_found[count]) + " failed."
+                    #    continue
+            
+                #Process APM search
+                if apm or apmRulesVerbose or apmRules or ce:
+                    if debug:
+                        print debugStr, "execute_main_tasks(): Processing Task: APM"
+                    if file_output:
+                        apm_process = multiprocessing.Process(target=process_apm, args=(alertId, ccsEnv))
+                        jobs.append(apm_process)
+                    else:
+                        process_apm(alertId,ccsEnv)
+                #Process AE search
+                if ae:
+                    if debug:
+                        print debugStr, "execute_main_tasks(): Processing Task: AlertExecutor"
+                    if file_output:
+                        ae_process = multiprocessing.Process(target=process_ae, args=(alertId, ccsEnv))
+                        jobs.append(ae_process)
+                    else:
+                        process_ae(alertId,ccsEnv)
+                if sms:
+                    if debug:
+                        print debugStr, "execute_main_tasks(): Processing Task: SMS Logs"
+                    if file_output:
+                        a7_log_process_sms = multiprocessing.Process(target=process_a7_log, args=(alertId, ccsEnv, 'sms'))
+                        jobs.append(a7_log_process_sms)
+                    else:
+                        process_a7_log(alertId,ccsEnv,'sms')
+                if email:
+                    if debug:
+                        print debugStr, "execute_main_tasks(): Processing Task: Email Logs"
+                    if file_output:
+                        a7_log_process_email = multiprocessing.Process(target=process_a7_log, args=(alertId, ccsEnv, 'email'))
+                        jobs.append(a7_log_process_email)
+                    else:
+                        process_a7_log(alertId,ccsEnv,'email')
+                if smsinb:
+                    if debug:
+                        print debugStr, "execute_main_tasks(): Processing Task: SMS Inbound Logs"
+                    if file_output:
+                        a7_log_process_smsinb = multiprocessing.Process(target=process_a7_log, args=(alertId, ccsEnv, 'smsinb'))
+                        jobs.append(a7_log_process_smsinb)
+                    else:
+                        process_a7_log(alertId,ccsEnv,'smsinb')
+                if voice:
+                    if debug:
+                        print debugStr, "execute_main_tasks(): Processing Task: Voice Logs"
+                    if file_output:
+                        #voice_process_call_stats = multiprocessing.Process(target=process_voice, args=(alertId, ccsEnv, dc, 'call-stats'))
+                        #jobs.append(voice_process_call_stats)
+                        voice_process_voiceapp = multiprocessing.Process(target=process_voice, args=(alertId, ccsEnv, dc, 'logs-voiceapp'))
+                        jobs.append(voice_process_voiceapp)
+                        voice_process_freeswitch = multiprocessing.Process(target=process_voice, args=(alertId, ccsEnv, dc, 'logs-freeswitch'))
+                        jobs.append(voice_process_freeswitch)
+                        voice_process_vii_agent = multiprocessing.Process(target=process_voice, args=(alertId, ccsEnv, dc, 'logs-vii-agent'))
+                        jobs.append(voice_process_vii_agent)
+                        voice_process_voice_controller = multiprocessing.Process(target=process_voice, args=(alertId, ccsEnv, dc, 'logs-voice-controller'))
+                        jobs.append(voice_process_voice_controller)
+                    else:
+                        #process_voice(alertId,ccsEnv, dc ,'call-stats')
+                        process_voice(alertId,ccsEnv, dc ,'logs-voiceapp')
+                        process_voice(alertId,ccsEnv, dc ,'logs-freeswitch')
+                        process_voice(alertId,ccsEnv, dc ,'logs-vii-agent')
+                        process_voice(alertId,ccsEnv, dc ,'logs-voice-controller')
+                count += 1
+                
+                #Only start workers if we're outputting to a file
+                if file_output:
+                    #Start workers
+                    if apm:
+                        apm_process.start()
+                    time.sleep(10)
+                    if ae:
+                        ae_process.start()
+                    if adl:
+                        adl_process.start()
+
+                    if sms:
+                        a7_log_process_sms.start()
+                    if email:
+                        a7_log_process_email.start()
+                    if smsinb:
+                        a7_log_process_smsinb.start()
+                    if payload:
+                        payload_process.start()
+                    if voice:
+                        #voice_process_call_stats.start()
+                        voice_process_voiceapp.start()
+                        voice_process_freeswitch.start()
+                        voice_process_vii_agent.start()
+                        voice_process_voice_controller.start()
+                        
+                    #Block until all workers are finished
+                    if sms:
+                        a7_log_process_sms.join(600)
+                    if email:
+                        a7_log_process_email.join(600)
+                    if smsinb:
+                        a7_log_process_smsinb.join(600)
+                    if apm:
+                        apm_process.join(600)
+                    if adl:
+                        adl_process.join(600)
+                    if ae:
+                        ae_process.join(600)
+                    if payload:
+                        payload_process.join(600)
+                    if voice:
+                        #voice_process_call_stats.join()
+                        voice_process_voiceapp.join(1200)
+                        voice_process_freeswitch.join(1200)
+                        voice_process_vii_agent.join(1200)
+                        voice_process_voice_controller.join(1200)
+                        
+                if zipfilename:
+                    if debug:
+                        print debugStr, "execute_main_tasks(): Creating zip archive of logs"
+                    filename=create_zip_archive(alertId)
+                    if len(filename) > 0:  
+                        print(Fore.MAGENTA + "\nZIP GENERATED:\tAvailable as " + Style.BRIGHT +Fore.GREEN + os.getcwd() + "/" + filename + Style.RESET_ALL + Fore.MAGENTA + "\nZIP DOWNLOAD:\t" 
+                        + Fore.GREEN + "Download w/ SCP or with" + Fore.BLUE + " iTerm2" + Fore.GREEN + ": " + Fore.YELLOW + " /opt/sysadmin/packages/operations/tools/bash_config/functions/dl " + filename)
+                    else:
+                        print warnStr, Style.BRIGHT + Fore.YELLOW + " Zipfile was not created."
+                if debug:
+                    print debugStr, Fore.GREEN + "Generating a new set of filenames to store logs for next alert"
+                #Generate new filenames, a new one for each WF alertId
+                generate_filenames()
+            return True
+    else:
+        return False
+
+#Post a iterm2 notification using growl 
+def growl_notify(code):
+    #print "Notify:" + "printf '\\e]9;" + code + "\\a'"
+    os.system("printf '\\e]9;" + code + "\\a'")
+
+##################### END OF FUNCTIONS #######################
+
+def main():
+    global debug
+    global script
+    global zipfilename
+    global file_output
+    global console
+    global ccsnEnv
+    global envOverride
+    global adl
+    global apm
+    global apmRules
+    global apmRulesVerbose
+    global ce
+    global ae
+    global sms
+    global email
+    global smsinb
+    global payload
+    global voice
+    global quiet
+    
+    # Set Args
+    init(autoreset=True)
+
+    if len(sys.argv) < 2:
+        print USAGE
+        exit()
+    for i in sys.argv:
+        if re.match('.+-.+-.+', i):
+            inputId = i
+        elif i == '-h' or i == '--help':
+            print USAGE
+            exit()
+        elif i == '-d' or i == '--debug':
+            debug = 1
+        elif i == '-q' or i == '--quiet':
+            quiet = 1
+        elif i == '-s' or i == '--script':
+            script = 1
+        elif i == '-z' or i == '--zip':
+            zipfilename = 1
+            file_output = 1
+            console=0
+        elif (i == '-z' or i == '--zip') and not (i == '-f' or i == '--file'):
+            zipfilename = 1
+            file_output = 1
+            console=0
+        elif (i == '-con' or i == '--console') and (i == '-f' or i == '--file'):
+            console=1
+            file_output=1
+        elif (i == '-con' or i == '--console') and not (i == '-f' or i == '--file'):
+            console=1
+            file_output=0
+        elif (i == '-f' or i == '--file') and not (i == '-con' or i == '--console'):
+            console=0
+            file_output=1
+        elif i == '-con' or i == '--console':
+            console=1
+        elif i == '-f' or i == '--file':
+            file_output = 1   
+        elif i == '--cqa':
+            ccsEnv = 'cqa'
+            envOverride = 1
+        elif i == '--prod':
+            ccsEnv = 'prod'
+            envOverride = 1
+        elif i == '--deep':
+            thirdPassContext = 300
+        elif i == '-all' or i == '--all':
+            adl=1
+            apm=1
+            apmRules=1
+            apmRulesVerbose=1
+            ce=1
+            ae=1
+            sms=1
+            email=1
+            smsinb=1
+            payload=1
+            voice=1
+            #Check for EC2 Key
+            if not check_file_exists(aws_ec2_dsa):
+                print warnStr, Fore.RED + "Error: CCS Voice 'ec2_dsa' key must exist in your home directory in order to query ccs voice logs."
+                exit()
+        elif i == '-vo' or i == '--vo' or i == '--voice':
+            voice = 1
+            #Check for EC2 Key
+            if not check_file_exists(aws_ec2_dsa):
+                print warnStr, Fore.RED + "Error: CCS Voice 'ec2_dsa' key must exist in your home directory in order to query ccs voice logs."
+                exit()
+        elif i == '-ae' or i == '--ae' or i == '--executor':
+            ae = 1
+        elif i == '-sms' or i == '--sms' or i == '--sms':
+            sms = 1
+        elif i == '-i' or i == '--smsinb' or i == '--smsinb':
+            smsinb = 1
+        elif i == '-email' or i == '--email' or i == '--email': 
+            email = 1
+        elif i == '-ce' or i == '--ce' or i == '--explorer': 
+            ce = 1
+        elif i == '-apm' or i == '--apm':
+            apmCaseRef = 1
+            apm = 1
+        elif i == '-r' or i == '--rules':
+            apm = 1
+            apmRules = 1
+            apmRulesVerbose = 1
+        elif i == '-adl' or i == '--adl':
+            adl = 1
+        elif i == '-p' or i == '--payload':
+            payload = 1
+        elif i == '-rv' or i == '--rulesdetail':    
+            apmCaseRef = 1
+            apmRulesVerbose = 1
+        else:
+            if i.endswith("logf") or i.endswith("logf.py"):
+                pass
+            else: 
+                print warnStr, "Exiting. One or more arguments entered could not be parsed, please check your entry: " + str(i)
+                exit(1)
+
+    if inputId == '':
+        exit('invalid id')
+
+    ########################
+    #   Main starts here   #
+    ########################
+    #generate filenames
+    generate_filenames()
+
+    ##Process APM ##
+    #Split ID into component parts
+    global idDict
+
+    idDict = split_id(inputId)
+    logDate = idDict['year'] + '-' + idDict['month'] + '-' + idDict['day']
+
+    global appName
+    ## START APM PROCESSING ###
+    appName = idDict['name']
+    #Detected APM CaseRed was entered for inputId
+    if idDict['type'] == 'apm':
+        caseRef=inputId
+        if debug:
+            print debugStr, "APM CaseRef detected as inputId"
+        try:
+             envOverride
+        except:
+             ccsEnv = run_proc('adeptra-uname -Y').stdout.read().rstrip().lower()
+        alertIds = []
+        alertIds = find_alertids_by_caseid(caseRef,ccsEnv)
+        if len(alertIds) < 1:
+            if ccsEnv == 'prod':
+                if not quiet:
+                    print 'No match found, trying CQA...'
+                ccsEnv = 'cqa'
+                alertIds = find_alertids_by_caseid(caseRef,ccsEnv)
+                if adl or apmRulesVerbose or apmRules or apm or payload or ae or email or sms or smsinb:
+                    for alert in alertIds:
+                        execute_main_tasks(alert,ccsEnv)
+                msg="logf: No match found CQA or PROD"
+                growl_notify(msg)
+                exit()
+            else:
+                if not quiet:
+                    print 'No match found, trying PROD...'
+                ccsEnv = 'prod'
+                alertIds = find_alertids_by_caseid(caseRef,ccsEnv)
+                if adl or apmRulesVerbose or apmRules or apm or payload or ae or email or sms or smsinb:
+                    for alert in alertIds:
+                        execute_main_tasks(alert,ccsEnv)
+
+                msg="logf: No match found CQA or PROD"
+                growl_notify(msg)
+                exit()
+        else:
+            if debug:
+                print debugStr, "AlertID Match found, executing main tasks"
+            if adl or apmRulesVerbose or apmRules or apm or payload or ae or email or sms or smsinb:
+                for alert in alertIds:
+                    execute_main_tasks(alert,ccsEnv)
+                    msg="logf: Search complete"
+                    growl_notify(msg)
+                    exit()
+            else:
+                msg="logf: Search complete"
+                growl_notify(msg)
+                exit()
+    # Find environment
+    try:
+        envOverride
+    except:
+        #Find the environment we're running in def now(self):
+        ccsEnv = run_proc('adeptra-uname -Y').stdout.read().rstrip().lower()
+
+    execution_result=execute_main_tasks(inputId, ccsEnv)
+
+    if execution_result == True:
+        msg="logf: Search complete"
+        growl_notify(msg)
+        exit()
+    else:
+        if ccsEnv == 'prod':
+            print 'No match found, trying CQA...'
+            ccsEnv = 'cqa'
+        else:
+            print 'No match found, trying PROD...'
+            ccsEnv = 'prod'    
+
+        execution_result=execute_main_tasks(inputId, ccsEnv)
+    if execution_result == False:
+        msg="logf: No match found CQA or PROD"
+        growl_notify(msg)
+        exit()
+    else:
+        msg="logf: Search complete"
+        growl_notify(msg)
+        exit()
+
+if __name__ == '__main__':
+    main()
+
+
+
+ 
